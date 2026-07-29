@@ -64,7 +64,9 @@ class NavSimScenario(AbstractScenario):
         self._log_name = self._scene_data.log_name
         self._route_roadblock_ids = self._scene.frames[self._initial_frame_idx].roadblock_ids
 
-        self._time_points = [TimePoint(int(frame.timestamp)) for frame in self._scene.frames]
+        self._time_points = [
+            TimePoint(int(frame.timestamp)) if frame is not None else TimePoint(0) for frame in self._scene.frames
+        ]
         self._future_sampling = TrajectorySampling(num_poses=len(self._time_points) + 1, interval_length=0.5)
         self._ego_vehicle_parameters = ego_vehicle_parameters
 

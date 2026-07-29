@@ -1,3 +1,5 @@
+import navsim._torch_pytree_compat  # noqa: F401 -- must run before transformers is imported anywhere, even transitively
+
 from typing import Tuple
 from pathlib import Path
 import logging

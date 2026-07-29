@@ -104,6 +104,8 @@ class RAPModel(nn.Module):
         self.scorer = Scorer(config)
         self.domain_classifier = DomainClassifier(config.tf_d_model)
         self.lambda_scheduler = LambdaScheduler(gamma=10.0)
+        self.progress = 1.0
+        self.batch_size = 0
         self.b2d=config.b2d
 
     def forward(self, features: Dict[str, torch.Tensor],targets: Dict[str, torch.Tensor],return_score=False) -> Dict[str, torch.Tensor]:

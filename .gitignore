@@ -13,3 +13,8 @@ wandb
 *.ckpt
 MySubmission
 *.json
+
+**/weights
+**/my_dump
+**/metric_cache*
+**/raster_viz

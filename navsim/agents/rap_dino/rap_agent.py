@@ -118,7 +118,13 @@ class RAPAgent(AbstractAgent):
                 state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
                     "state_dict"]
                 self.device = torch.device("cpu")
-            self.load_state_dict({k.replace("agent._rap_model", "_rap_model"): v for k, v in state_dict.items()})
+            missing_keys, unexpected_keys = self.load_state_dict(
+                {k.replace("agent._rap_model", "_rap_model"): v for k, v in state_dict.items()}, strict=False
+            )
+            if missing_keys:
+                print(f"Missing keys when loading pretrained weights: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
             self.to(self.device)
 
     def get_sensor_config(self) :
