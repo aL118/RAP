@@ -88,6 +88,15 @@ class RAPConfig:
 
     camera_width: int = 1024
     camera_height: int = 256
+
+    # Images pushed through the DINOv3 ViT-H in one call. The encoder flattens to
+    # (batch * num_cams) images, so batch=8 with 4 cameras is already 32 images of
+    # 256x1024 = 1024 patch tokens each; every OOM traceback in job 7411178 landed in
+    # the ViT's scaled_dot_product_attention. The ViT is frozen (rap_agent.get_optimizers
+    # sets requires_grad=False), so splitting the call is arithmetically identical and
+    # just caps the transient q/k/v and MLP buffers at chunk-many images instead of all
+    # of them. 0 disables chunking.
+    vit_forward_chunk: int = 32
     lidar_resolution_width = 256
     lidar_resolution_height = 256
 

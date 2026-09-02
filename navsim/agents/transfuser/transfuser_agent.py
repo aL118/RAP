@@ -81,6 +81,6 @@ class TransfuserAgent(AbstractAgent):
         """Inherited, see superclass."""
         return torch.optim.Adam(self._transfuser_model.parameters(), lr=self._lr)
 
-    def get_training_callbacks(self) -> List[pl.Callback]:
+    def get_training_callbacks(self, output_dir=None) -> List[pl.Callback]:
         """Inherited, see superclass."""
         return [TransfuserCallback(self._config)]

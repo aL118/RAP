@@ -591,7 +591,7 @@ class PadAgent(AbstractAgent):
 
 
 
-    def get_training_callbacks(self):
+    def get_training_callbacks(self, output_dir=None):
 
         checkpoint_cb = ModelCheckpoint(
             save_last=True,

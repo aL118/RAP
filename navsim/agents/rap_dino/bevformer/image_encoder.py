@@ -28,6 +28,7 @@ class ImgEncoder(nn.Module):
         self.use_grid_mask = True
 
         self.img_backbone = AutoModel.from_pretrained("facebook/dinov3-vith16plus-pretrain-lvd1689m")
+        self.vit_forward_chunk = getattr(config, "vit_forward_chunk", 0)
        # self.transform = make_transform(512)
                                    
         # original_mean = torch.tensor([[123.675, 116.28, 103.53]]).view(1,3,1,1)
@@ -73,6 +74,32 @@ class ImgEncoder(nn.Module):
         patch = patch.transpose(1, 2).reshape(B * N, -1, gh, gw)
         return patch
 
+    def _backbone_forward(self, img):
+        """Run the ViT over img in chunks along the (batch * num_cams) dimension.
+
+        Peak memory in the ViT is set by the widest live tensor inside one layer -- q/k/v
+        and the 4x-wide MLP over [n_imgs, 1024 tokens, 1280 dims] -- so it grows linearly
+        with the number of images in the call while the returned features do not. Chunking
+        trades a handful of extra kernel launches for a bounded peak.
+
+        Gradients are enabled only if the ViT is actually being trained. get_optimizers()
+        freezes it, which already keeps autograd from taping this subgraph, but the
+        vit_params group there is one uncommented line away from being trained again --
+        keying off requires_grad means chunking stays correct either way instead of
+        silently dropping the backbone's gradients.
+        """
+        chunk = self.vit_forward_chunk
+        if not chunk or chunk >= img.shape[0]:
+            return self.img_backbone(pixel_values=img)["last_hidden_state"]
+
+        trainable = any(p.requires_grad for p in self.img_backbone.parameters())
+        with torch.set_grad_enabled(trainable and torch.is_grad_enabled()):
+            feats = [
+                self.img_backbone(pixel_values=img[i:i + chunk])["last_hidden_state"]
+                for i in range(0, img.shape[0], chunk)
+            ]
+        return torch.cat(feats, dim=0)
+
     def forward(self,img,len_queue=None,**kwargs):
         B = img.size(0)
         if img is not None:
@@ -85,7 +112,7 @@ class ImgEncoder(nn.Module):
             #img = self.transform(img)
             if self.training and self.use_grid_mask:
                 img = self.grid_mask(img)
-            img_feats = self.img_backbone(pixel_values=img)['last_hidden_state']
+            img_feats = self._backbone_forward(img)
             img_feats = self._tokens_to_map(img_feats,B,N,img.shape[2],img.shape[3])
 
             if isinstance(img_feats, dict):

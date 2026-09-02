@@ -101,7 +101,7 @@ class AbstractAgent(torch.nn.Module, ABC):
         """
         raise NotImplementedError("No optimizers. Agent does not support training.")
 
-    def get_training_callbacks(self) -> List[pl.Callback]:
+    def get_training_callbacks(self, output_dir=None) -> List[pl.Callback]:
         """
         Returns a list of pytorch-lightning callbacks that are used during training.
         See navsim.planning.training.callbacks for examples.

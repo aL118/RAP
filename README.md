@@ -29,6 +29,45 @@
 
 ---
 
+> ## ⚠️ Evaluating this repo: which metric you get, and how
+>
+> **This repo only produces NAVSIM v1 PDMS (the 93.8 row). It cannot produce the 39.6 EPDMS row.**
+> `navsim/planning/script/run_pdm_score.py` here has zero two-stage support and
+> `pdm_scorer.py` is v1-only — no `LANE_KEEPING`, `HISTORY_COMFORT`,
+> `TWO_FRAME_EXTENDED_COMFORT` or `TRAFFIC_LIGHT_COMPLIANCE`. Nothing upstream matches
+> `navhard_two_stage`, `traffic_agents_policies`, or `synthetic_scenes_path` either. This is a
+> known gap, not a broken checkout: [issue #17](https://github.com/vita-epfl/RAP/issues/17)
+> asks exactly this and is still unanswered.
+>
+> | Metric | Split | How to run |
+> | --- | --- | --- |
+> | **PDMS** (v1, 93.8) | `navtest` | this repo's `run_pdm_score.py` — see [issue #10](https://github.com/vita-epfl/RAP/issues/10) for the maintainers' exact command (note it uses `agent=navsim_agent`, i.e. `PadAgent`) |
+> | **EPDMS** (v2, 39.6) | `navhard_two_stage` | `scripts/evaluation/run_navhard_evaluation.sh` — runs the **official navsim devkit**, with this repo's agent copied in |
+>
+> ### Four things that silently break the v2 run
+>
+> 1. **`conda activate rap`, not `navsim`.** RAP's BEVFormer needs `mmengine`/`mmcv`. The
+>    `navsim` env has neither and can't easily get them — it's on torch 2.8, while
+>    `mmcv 2.1.0` is built against torch 2.1.
+> 2. **`export PYTHONPATH=$HOME/navsim` is mandatory.** Both envs install a package named
+>    `navsim`. `python <path>/script.py` puts the *script's* directory on `sys.path`, never
+>    the cwd — so `cd` alone can't decide which checkout wins, and the run dies on the first
+>    override.
+> 3. **Use `RAP_DINO_navsimv2.ckpt`**, and keep `agent.config.trajectory_sampling.time_horizon=5`.
+> 4. **`worker=single_machine_thread_pool`**, not ray — ray workers are separate processes and
+>    each would load its own copy of the 3.9 GB checkpoint onto one GPU.
+>
+> ### Don't rebuild the metric cache
+>
+> Reuse `$HOME/navsim/metric_cache_navhard` (1.2 GB, 5912 scenarios). It is
+> **agent-independent** — `default_metric_caching.yaml` names no agent, and
+> `MetricCacheProcessor` takes only `cache_path` / `force_feature_computation` /
+> `proposal_sampling`. It stores simulation and scoring state from the dataset and split; your
+> agent's trajectory is scored against it afterwards. Rebuilding takes ~12 min and changes
+> nothing.
+
+---
+
 🚗 **RAP (Rasterization Augmented Planning)** is a scalable data augmentation pipeline for end-to-end autonomous driving.  
 It leverages lightweight **3D rasterization** to generate counterfactual recovery maneuvers and cross-agent views and **Raster-to-Real feature alignment** to bridge the sim-to-real gap in feature space, achieving **state-of-the-art performance** on multiple benchmarks.
 

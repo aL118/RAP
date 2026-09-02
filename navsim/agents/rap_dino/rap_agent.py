@@ -39,6 +39,17 @@ class RAPAgent(AbstractAgent):
         if not cache_data:
             self._rap_model = RAPModel(config)
 
+            # Freeze the ViT HERE, not in get_optimizers(). Lightning's DDPStrategy.setup()
+            # calls configure_ddp() BEFORE setup_optimizers() (strategies/ddp.py), so by the
+            # time get_optimizers() flips requires_grad the DistributedDataParallel reducer
+            # has already built gradient buckets over every param that required grad at
+            # construction -- all 956.8M of them. That pins ~3.4 GiB of fp32 gradient
+            # buffers per rank for the 840.6M-param backbone that never produces a gradient,
+            # and makes find_unused_parameters traverse it every step. Freezing at
+            # construction means the reducer only ever sees the 116.2M trainable params.
+            for p in self._rap_model._backbone.img_backbone.parameters():
+                p.requires_grad = False
+
         if not cache_data:#only for training
             self.bce_logit_loss = nn.BCEWithLogitsLoss()
             self.b2d = config.b2d
@@ -82,10 +93,14 @@ class RAPAgent(AbstractAgent):
     def init_from_pretrained(self):
         # import ipdb; ipdb.set_trace()
         if self._checkpoint_path:
-            if torch.cuda.is_available():
-                checkpoint = torch.load(self._checkpoint_path)
-            else:
-                checkpoint = torch.load(self._checkpoint_path, map_location=torch.device('cpu'))
+            # map_location='cpu' unconditionally. Without it torch.load restores every
+            # tensor to the device it was SAVED from -- cuda:0 -- no matter what
+            # torch.cuda.set_device() says, because set_device only redirects NEW
+            # allocations, not deserialization. Under DDP that put all 8 ranks' copies of
+            # this 3.9 GB checkpoint on GPU 0 and OOM'd a 24 GB card (job 7411109).
+            # The model is still on CPU here anyway (self.to(self.device) happens in
+            # initialize()), so this also avoids a pointless GPU round-trip.
+            checkpoint = torch.load(self._checkpoint_path, map_location='cpu')
             
             state_dict = checkpoint['state_dict']
             
@@ -112,7 +127,10 @@ class RAPAgent(AbstractAgent):
             if torch.cuda.is_available():
                 device_id = torch.cuda.current_device()
                 print(f"Loading checkpoint on GPU#{torch.cuda.current_device()}")
-                state_dict: Dict[str, Any] = torch.load(self._checkpoint_path)["state_dict"]
+                # map_location='cpu': see init_from_pretrained above. self.to(self.device)
+                # at the end of this method does the placement.
+                state_dict: Dict[str, Any] = torch.load(
+                    self._checkpoint_path, map_location="cpu")["state_dict"]
                 self.device = torch.device(f"cuda:{device_id}")
             else:
                 state_dict: Dict[str, Any] = torch.load(self._checkpoint_path, map_location=torch.device("cpu"))[
@@ -582,7 +600,7 @@ class RAPAgent(AbstractAgent):
                 #{"params": vit_params,   "lr": vit_lr,   "weight_decay": 1e-4},
             ]
         )
-        scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-5, epochs=20, warmup_epochs=1)
+        scheduler = WarmupCosLR(optimizer=optimizer, lr=self._lr, min_lr=1e-5, epochs=10, warmup_epochs=1)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
         # optimizer = torch.optim.AdamW(self.parameters(), weight_decay=1e-4,lr=self._lr)
         # scheduler = WarmupCosLR(
@@ -597,14 +615,24 @@ class RAPAgent(AbstractAgent):
 
 
 
-    def get_training_callbacks(self):
-
+    def get_training_callbacks(self, output_dir=None):
+        # dirpath pins checkpoints to the run's own hydra output_dir. Left as None,
+        # ModelCheckpoint.__resolve_ckpt_dir falls back to the logger's save_dir, and
+        # WandbLogger defaults that to "." -- which is why job 7418765 wrote 12 GB into
+        # <repo>/rap/rap_navsim_train_quicktest/checkpoints instead of exp/. WANDB_DIR does
+        # not redirect this; it is a separate path from the logger's save_dir argument.
+        #
+        # No monitor + save_top_k=1 keeps only the most recent checkpoint under its numbered
+        # filename, and save_last=False suppresses the extra last.ckpt copy. Matches DrivoR
+        # (navsim/agents/.../get_training_callbacks). Note this saves the LATEST epoch, not
+        # the best-scoring one -- the previous config monitored val/score with mode="max".
         checkpoint_cb = ModelCheckpoint(
-            save_last=True,
-            save_top_k=3,
-            monitor='val/score',
-            filename='{epoch}-{step}',
-            mode="max"
+            dirpath=output_dir,
+            save_last=False,
+            save_top_k=1,
+            filename='epoch{epoch}-step{step}',
+            auto_insert_metric_name=False,
+            save_on_train_epoch_end=True,
             )
 
         return [checkpoint_cb]

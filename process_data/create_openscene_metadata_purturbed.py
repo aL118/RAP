@@ -290,7 +290,13 @@ def create_nuplan_info(db_name_and_args):
     # db_names_splited, start = get_scenes_per_thread(db_names, args.thread_num)
     # log_idx = start
 
-    renderer = ScenarioRenderer()
+    # Explicit list, not the bare ScenarioRenderer(): helpers/renderer.py:695 defaults to
+    # ['CAM_F0', 'CAM_L0', 'CAM_R0'] -- no CAM_B0. rap_agent.py:130-142 requests cam_b0 and
+    # rap_dino/bevformer/bev_feature_build.py:29 feeds it first, while dataclasses.py:80-82
+    # swallows the missing JPG and substitutes np.zeros((1080,1920,3)) with validity hardcoded
+    # True. Without CAM_B0 here the perturbed cache trains on a black rear view and nothing
+    # reports it. _aug.py:214 already passes the full list.
+    renderer = ScenarioRenderer(camera_channel_list=['CAM_F0', 'CAM_L0', 'CAM_R0', 'CAM_B0'])
     # for log_db_name in tqdm(db_names_splited, dynamic_ncols=True):
 
     log_db = NuPlanDB(args.nuplan_root_path, join(nuplan_db_path, log_db_name + ".db"), None)

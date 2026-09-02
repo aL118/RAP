@@ -915,19 +915,24 @@ def parse_args():
 
 
 
-def load_done_set(checkpoint_path='checkpoint.txt') -> set[int]:
-    """读取已完成 index 集合（若文件不存在，则返回空集合）"""
+def load_done_set(checkpoint_path='checkpoint.txt') -> set[str]:
+    """读取已完成 log 名集合（若文件不存在，则返回空集合）
+
+    Stores log NAMES, not positional indices: the task list is filtered by
+    navtrain membership and by what is currently downloaded, so a position is
+    only meaningful for one exact set of .db files on disk.
+    """
     if not os.path.exists(checkpoint_path):
         return set()
     with open(checkpoint_path, "r") as f:
-        return {int(line.strip()) for line in f if line.strip().isdigit()}
+        return {line.strip() for line in f if line.strip()}
 
 
-def append_done(idx: int, checkpoint_path='checkpoint.txt') -> None:
-    """将新完成的 index 追加到 checkpoint 文件"""
+def append_done(log_db_name: str, checkpoint_path='checkpoint.txt') -> None:
+    """将新完成的 log 名追加到 checkpoint 文件"""
     # 用 'a' 打开保证追加写，单线程（主进程）执行，不需要锁
     with open(checkpoint_path, "a") as f:
-        f.write(f"{idx}\n")
+        f.write(f"{log_db_name}\n")
 
 if __name__ == "__main__":
     args = parse_args()
@@ -939,15 +944,32 @@ if __name__ == "__main__":
     nuplan_map_root = args.nuplan_map_root
     out_dir = args.out_dir
 
+    import yaml
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(current_dir, "navtrain.yaml"), "r") as f:
+        navtrain = yaml.safe_load(f)
+    with open(os.path.join(current_dir, "default_train_val_test_log_split.yaml"), "r") as f:
+        trainval_logs = yaml.safe_load(f)
+
+    val_logs = set(trainval_logs['val_logs'])
+    log_names = set(navtrain['log_names'])
+
     db_names = [
         f[:-3]
         for f in os.listdir(args.nuplan_db_path)
         if os.path.isfile(os.path.join(args.nuplan_db_path, f))
     ]
+    on_disk = len(db_names)
+    # Same filter as create_openscene_metadata_purturbed.py:626-627. Without it this
+    # step augments every raw nuPlan log on disk, but navtrain -- the only split the
+    # training scene filters read -- covers a small fraction of them, so the rest is
+    # rendered and written for nothing.
+    db_names = [db_name for db_name in db_names if db_name in log_names]
+    db_names = [db_name for db_name in db_names if db_name not in val_logs]
     db_names.sort()
     total = len(db_names)
 
-    done_index = load_done_set()
+    done_names = load_done_set()
 
     tasks = [
         (idx, db_name, args)
@@ -957,9 +979,10 @@ if __name__ == "__main__":
     
     tasks = tasks[args.start_index:args.end_index]
 
-    tasks = [task for task in tasks if task[0] not in done_index]
+    tasks = [task for task in tasks if task[1] not in done_names]
 
-    print(f"processing {args.start_index} to {args.end_index} out of {total}")
+    print(f"processing {args.start_index} to {args.end_index} out of {total}"
+          f" navtrain logs ({on_disk} .db files on disk)")
     print(f'left {len(tasks)} tasks')
 
 
@@ -974,6 +997,6 @@ if __name__ == "__main__":
 
     with Pool(processes=args.thread_num) as pool:
         for result in tqdm(pool.imap_unordered(create_nuplan_info, tasks, chunksize=1),total=len(tasks)):
-            append_done(result)
+            append_done(db_names[result])
 
 

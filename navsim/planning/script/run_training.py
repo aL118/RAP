@@ -1,5 +1,6 @@
 import navsim._torch_pytree_compat  # noqa: F401 -- must run before transformers is imported anywhere, even transitively
 
+import os
 from typing import Tuple
 from pathlib import Path
 import logging
@@ -7,6 +8,7 @@ import logging
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 
@@ -95,6 +97,59 @@ def main(cfg: DictConfig) -> None:
 
     logger.info(f"Path where all results are stored: {cfg.output_dir}")
 
+    # Pin this rank's GPU BEFORE the agent is built. rap_agent.py:115-116 does
+    #     device_id = torch.cuda.current_device(); self.device = torch.device(f"cuda:{device_id}")
+    # and then self.to(self.device) -- but the agent is constructed here, before
+    # trainer.fit(), which is where Lightning normally assigns each rank its device. So
+    # torch.cuda.current_device() is still 0 in every subprocess and all N ranks load the
+    # model onto cuda:0. With 8 ranks that OOMs a 24 GB card during construction (observed,
+    # job 7410887: eight processes on GPU 0, 3.31 MiB free).
+    # Lightning's SubprocessScriptLauncher sets LOCAL_RANK for every child
+    # (subprocess_script.py:125,130), so it is available this early.
+    if torch.cuda.is_available():
+        _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if _local_rank < torch.cuda.device_count():
+            torch.cuda.set_device(_local_rank)
+        logger.info(f"Rank {_local_rank} pinned to cuda:{torch.cuda.current_device()}")
+
+    # RAP_MEM_DEBUG=1 prints a per-rank CUDA memory breakdown at the points that separate
+    # "resident" cost (weights, DDP gradient buckets, optimizer state) from "per-step" cost
+    # (activations). Batch size only moves the second number, so if fit-start is already
+    # near capacity the batch size is the wrong lever.
+    if os.environ.get("RAP_MEM_DEBUG"):
+        class _MemProbe(pl.Callback):
+            @staticmethod
+            def _report(tag: str) -> None:
+                rank = int(os.environ.get("LOCAL_RANK", 0))
+                alloc = torch.cuda.memory_allocated() / 2**30
+                reserved = torch.cuda.memory_reserved() / 2**30
+                peak = torch.cuda.max_memory_allocated() / 2**30
+                logger.info(
+                    f"[mem][rank {rank}] {tag}: allocated {alloc:.2f} GiB, "
+                    f"reserved {reserved:.2f} GiB, peak {peak:.2f} GiB"
+                )
+
+            def on_fit_start(self, trainer, pl_module):
+                # Everything resident before a single activation exists.
+                self._report("fit start (weights + ddp buckets + optim)")
+
+            def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+                if batch_idx < 3:
+                    self._report(f"train batch {batch_idx} start")
+
+            def on_before_backward(self, trainer, pl_module, loss):
+                if trainer.global_step < 3:
+                    self._report(f"step {trainer.global_step} after forward")
+
+            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                if batch_idx < 3:
+                    self._report(f"train batch {batch_idx} end")
+                    torch.cuda.reset_peak_memory_stats()
+
+        _mem_callbacks = [_MemProbe()]
+    else:
+        _mem_callbacks = []
+
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)
 
@@ -153,7 +208,10 @@ def main(cfg: DictConfig) -> None:
                 feature_builders=agent.get_feature_builders(),
                 target_builders=agent.get_target_builders())
             N = len(train_data_perturbed)
-            indices = random.sample(range(N), int(0.1*N))
+            # Fraction of the perturbed pool to draw. Default 0.1 matches the released
+            # recipe, which caches the full split; set to 1.0 when the cache is already
+            # sized to what should be consumed (see make_cache_subsets.py).
+            indices = random.sample(range(N), int(cfg.get('perturbed_fraction', 0.1)*N))
             print(f'len(perturbed): {len(indices)}')
             train_data_perturbed = Subset(train_data_perturbed, indices)
 
@@ -164,7 +222,7 @@ def main(cfg: DictConfig) -> None:
                 
             train_data_others.score_mask=False
             N = len(train_data_others)
-            indices = random.sample(range(N), int(0.05*N))
+            indices = random.sample(range(N), int(cfg.get('others_fraction', 0.05)*N))
             print(f'len(others): {len(indices)}')
             train_data_others = Subset(train_data_others, indices)
 
@@ -181,7 +239,10 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks(), logger=WandbLogger(project="rap", name=cfg.experiment_name, id=cfg.experiment_name),
+    # save_dir keeps wandb's own files next to the run instead of in the cwd; the
+    # checkpoint path is pinned separately via get_training_callbacks(cfg.output_dir),
+    # which short-circuits ModelCheckpoint's logger-derived fallback entirely.
+    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks(cfg.output_dir) + _mem_callbacks, logger=WandbLogger(project="rap", name=cfg.experiment_name, id=cfg.experiment_name, save_dir=cfg.output_dir),
             )
 
     logger.info("Starting Training")

@@ -6,7 +6,8 @@ import numpy as np
 import numpy.typing as npt
 import shapely.vectorized
 from shapely.strtree import STRtree
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
+from shapely.geometry.base import BaseGeometry
 
 from nuplan.common.maps.abstract_map import AbstractMap, MapObject
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer
@@ -36,7 +37,13 @@ class PDMOccupancyMap:
 
         # attribute
         self._tokens = tokens
-        self._geometries = geometries
+        # The train metric cache stores drivable-area polygons as float32 exterior-ring
+        # arrays (see train_cache_processor.py) rather than shapely objects, so rebuild
+        # them here. Caches written with real geometries pass through untouched.
+        if len(geometries) and not isinstance(geometries[0], BaseGeometry):
+            self._geometries = [Polygon(geometry) for geometry in geometries]
+        else:
+            self._geometries = geometries
         self._node_capacity = node_capacity
 
         # loaded during initialization
