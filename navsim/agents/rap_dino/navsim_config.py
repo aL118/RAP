@@ -16,6 +16,19 @@ class RAPConfig:
     train_metric_cache_path: str = "./train_metric_cache"
     ref_num: int=4
 
+    # Checkpointing. Epochs here are training epochs, so at max_epochs=10 an
+    # interval of 2 writes at epochs 1,3,5,7,9 (Lightning counts from 0).
+    #
+    # keep_n is ModelCheckpoint's save_top_k. There is no monitored metric, so
+    # "top" means most recent, and 1 -- the previous hardcoded value -- keeps a
+    # single rolling file: every write replaces the one before it. That is fine
+    # at an interval of 1, where the point is only to survive a crash, but it
+    # cancels out a wider interval, which is asked for precisely to keep a
+    # history. -1 retains every checkpoint; each is ~4 GB, so budget before
+    # raising this on a long run.
+    checkpoint_every_n_epochs: int = 1
+    checkpoint_keep_n: int = 1
+
     traj_bev: bool=True
     traj_proposal_query: bool=True
 

@@ -1,0 +1,55 @@
+# RAP plus a PPO-trained residual, as an agent run_pdm_score.py can drive.
+#
+# Mirrors rap_agent.yaml field for field on purpose: the RL agent runs the identical
+# RAP model and must select the identical base trajectory, so any difference in this
+# block is a difference in the baseline the residual is stacked on.
+#
+#   agent=rl_agent \
+#   agent.checkpoint_path=<the RAP .ckpt rl/precompute.py used> \
+#   agent.policy_path=<exp>/rap_rl_ppo/final_model.zip
+#
+# Set agent.disable_residual=True for the baseline: same code path, same weights,
+# residual forced to zero. That is the honest A/B against the RL number.
+_target_: rl.agent.RLResidualAgent
+_convert_: 'all'
+
+config:
+  _target_: navsim.agents.rap_dino.navsim_config.RAPConfig
+  _convert_: 'all'
+
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: 'all'
+    # 5, not rap_agent.yaml's 4. This must equal the horizon rl/precompute.py ran with
+    # (RAP_DINO_navsimv2.ckpt was trained at 5 -> 10 poses), because the policy's action
+    # is one residual per pose. A mismatch is caught by rl/residual.check_action_dim
+    # rather than being reshaped into nonsense.
+    time_horizon: 5
+    interval_length: 0.5
+
+  latent: False
+  distill_feature: True
+  pdm_scorer: True
+  cache_data: False
+  train_metric_cache_path: './train_metric_cache'
+
+# Pretrained RAP weights -- the same file rl/precompute.py encoded the cache with.
+checkpoint_path: ''
+
+# PPO .zip from rl/train.py.
+policy_path: ''
+# Observation statistics. Empty -> vecnormalize.pkl next to policy_path, which is where
+# train.py writes it. These are part of the trained model, not an optional extra.
+vecnormalize_path: ''
+
+# Must match RLConfig.residual_scale at training time: the policy's [-1, 1] action means
+# nothing without the scale it was trained under.
+residual_scale: [1.0, 1.0, 0.1]
+
+# Evaluation uses the action distribution's mean, not a sample.
+deterministic: True
+
+# True -> plain RAP through this same code path, for the baseline column.
+disable_residual: False
+
+lr: 1e-4

@@ -622,14 +622,25 @@ class RAPAgent(AbstractAgent):
         # <repo>/rap/rap_navsim_train_quicktest/checkpoints instead of exp/. WANDB_DIR does
         # not redirect this; it is a separate path from the logger's save_dir argument.
         #
-        # No monitor + save_top_k=1 keeps only the most recent checkpoint under its numbered
-        # filename, and save_last=False suppresses the extra last.ckpt copy. Matches DrivoR
-        # (navsim/agents/.../get_training_callbacks). Note this saves the LATEST epoch, not
-        # the best-scoring one -- the previous config monitored val/score with mode="max".
+        # No monitor, so "top" means most recent, not best-scoring -- the previous
+        # config monitored val/score with mode="max". save_last=False suppresses the
+        # extra last.ckpt copy. Matches DrivoR (navsim/agents/.../get_training_callbacks).
+        #
+        # Interval and retention come from the config so a run can be checkpointed
+        # without editing this file; see RAPConfig.checkpoint_every_n_epochs. The two
+        # have to be set together: a wider interval with keep_n left at 1 still leaves
+        # exactly one file on disk, just written less often, which is the opposite of
+        # what a wider interval is usually asked for.
+        #
+        # run_training.py resumes with ckpt_path='last'. That resolves against this
+        # dirpath, and with save_last=False it finds the newest numbered file instead
+        # of a last.ckpt -- so a requeued job restarts from the most recent write,
+        # which at an interval of n can be up to n-1 epochs of lost work.
         checkpoint_cb = ModelCheckpoint(
             dirpath=output_dir,
             save_last=False,
-            save_top_k=1,
+            save_top_k=self._config.checkpoint_keep_n,
+            every_n_epochs=self._config.checkpoint_every_n_epochs,
             filename='epoch{epoch}-step{step}',
             auto_insert_metric_name=False,
             save_on_train_epoch_end=True,

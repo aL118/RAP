@@ -19,3 +19,9 @@ MySubmission
 **/metric_cache*
 **/raster_viz
 **/process_data/*.txt
+
+# Scratch. TMPDIR is pointed at tmp/<job id> by the run scripts; the bare
+# pymp-*/tmp* patterns catch anything started without that env set.
+tmp/
+pymp-*
+tmp*

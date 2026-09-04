@@ -17,5 +17,12 @@ config:
   cache_data: False
   train_metric_cache_path: './train_metric_cache'
 
+  # Declared here, not only on RAPConfig: hydra composes this node in struct
+  # mode, so an override for a key the yaml does not carry is rejected before
+  # the dataclass is ever instantiated -- adding the field to RAPConfig alone
+  # is not enough to make `agent.config.<key>=...` work on the command line.
+  checkpoint_every_n_epochs: 1
+  checkpoint_keep_n: 1
+
 checkpoint_path: ''
 lr: 1e-4
