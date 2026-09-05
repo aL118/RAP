@@ -185,6 +185,44 @@ def plot_cameras_frame_with_annotations(scene: Scene, frame_idx: int) -> Tuple[p
 
     return fig, ax
 
+def plot_cameras_frame_with_agent(scene: Scene, frame_idx: int, agent: AbstractAgent, agent_scene: Scene) -> Tuple[plt.Figure, Any]:
+    """
+    Plots 8x cameras and birds-eye-view visualization in 3x3 grid
+    :param scene: navsim scene dataclass
+    :param frame_idx: index of selected frame
+    :return: figure and ax object of matplotlib
+    """
+    try: # Handle synthetic scenes
+        human_trajectory = scene.get_future_trajectory()
+    except AssertionError:
+        human_trajectory = None
+    agent_trajectory = agent.compute_trajectory(agent_scene.get_agent_input())
+
+    frame = scene.frames[frame_idx]
+    fig, ax = plt.subplots(3, 3, figsize=CAMERAS_PLOT_CONFIG["figure_size"])
+
+    add_camera_ax(ax[0, 0], frame.cameras.cam_l0)
+    add_camera_ax(ax[0, 1], frame.cameras.cam_f0)
+    add_camera_ax(ax[0, 2], frame.cameras.cam_r0)
+
+    add_camera_ax(ax[1, 0], frame.cameras.cam_l1)
+    add_configured_bev_on_ax(ax[1, 1], scene.map_api, frame)
+    if human_trajectory:
+        add_trajectory_to_bev_ax(ax[1, 1], human_trajectory, TRAJECTORY_CONFIG["human"])
+    add_trajectory_to_bev_ax(ax[1, 1], agent_trajectory, TRAJECTORY_CONFIG["agent"])
+    add_camera_ax(ax[1, 2], frame.cameras.cam_r1)
+
+    add_camera_ax(ax[2, 0], frame.cameras.cam_l2)
+    add_camera_ax(ax[2, 1], frame.cameras.cam_b0)
+    add_camera_ax(ax[2, 2], frame.cameras.cam_r2)
+
+    configure_all_ax(ax)
+    configure_bev_ax(ax[1, 1])
+    fig.tight_layout()
+    fig.subplots_adjust(wspace=0.01, hspace=0.01, left=0.01, right=0.99, top=0.99, bottom=0.01)
+
+    return fig, ax
+
 
 def frame_plot_to_pil(
     callable_frame_plot: Callable[[Scene, int], Tuple[plt.Figure, Any]],

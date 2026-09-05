@@ -54,9 +54,9 @@ def add_annotations_to_bev_ax(ax: plt.Axes, annotations: Annotations, add_ego: b
         agent_type = tracked_object_types[name_value]
 
         x, y, heading = (
-            box_value[BoundingBoxIndex.X],
-            box_value[BoundingBoxIndex.Y],
-            box_value[BoundingBoxIndex.HEADING],
+            box_value[0],
+            box_value[1],
+            box_value[6],
         )
         box_length, box_width, box_height = box_value[3], box_value[4], box_value[5]
         agent_box = OrientedBox(StateSE2(x, y, heading), box_length, box_width, box_height)
@@ -142,8 +142,8 @@ def add_lidar_to_bev_ax(ax: plt.Axes, lidar: Lidar) -> plt.Axes:
     lidar_pc = filter_lidar_pc(lidar.lidar_pc)
     lidar_pc_colors = get_lidar_pc_color(lidar_pc, as_hex=True)
     ax.scatter(
-        lidar_pc[LidarIndex.Y],
-        lidar_pc[LidarIndex.X],
+        lidar_pc[1],
+        lidar_pc[0],
         c=lidar_pc_colors,
         alpha=LIDAR_CONFIG["alpha"],
         s=LIDAR_CONFIG["size"],

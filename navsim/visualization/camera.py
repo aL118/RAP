@@ -72,9 +72,9 @@ def add_annotations_to_camera_ax(ax: plt.Axes, camera: Camera, annotations: Anno
         camera.sensor2lidar_translation,
     )
     box_positions, box_dimensions, box_heading = (
-        boxes[:, BoundingBoxIndex.POSITION],
-        boxes[:, BoundingBoxIndex.DIMENSION],
-        boxes[:, BoundingBoxIndex.HEADING],
+        boxes[:, slice(0, 2 + 1)],
+        boxes[:, slice(3, 5 + 1)],
+        boxes[:, 6],
     )
     corners_norm = np.stack(np.unravel_index(np.arange(8), [2] * 3), axis=1)
     corners_norm = corners_norm[[0, 1, 3, 2, 4, 5, 7, 6]]
@@ -111,11 +111,11 @@ def _transform_annotations_to_camera(
     """
 
     locs, rots = (
-        boxes[:, BoundingBoxIndex.POSITION],
-        boxes[:, BoundingBoxIndex.HEADING :],
+        boxes[:, slice(0, 2 + 1)],
+        boxes[:, 6 :],
     )
     dims_cam = boxes[
-        :, [BoundingBoxIndex.LENGTH, BoundingBoxIndex.HEIGHT, BoundingBoxIndex.WIDTH]
+        :, [3, 5, 4]
     ]  # l, w, h -> l, h, w
 
     rots_cam = np.zeros_like(rots)
@@ -283,7 +283,7 @@ def _transform_pcs_to_images(
     :param eps: threshold for lidar pc height, defaults to 1e-3
     :return: lidar pc in pixel coordinates, mask of values in frame
     """
-    pc_xyz = lidar_pc[LidarIndex.POSITION, :].T
+    pc_xyz = lidar_pc[slice(0, 2 + 1), :].T
 
     lidar2cam_r = np.linalg.inv(sensor2lidar_rotation)
     lidar2cam_t = sensor2lidar_translation @ lidar2cam_r.T
