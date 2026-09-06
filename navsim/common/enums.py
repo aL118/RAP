@@ -46,7 +46,14 @@ class StateSE2Index(IntEnum):
 
 
 class BoundingBoxIndex(IntEnum):
-    """Intenum of bounding boxes in logs."""
+    """Intenum of bounding boxes in logs.
+
+    A box row is [x, y, z, length, width, height, roll, pitch, yaw]. It used to
+    be seven wide, ending at a single heading; roll and pitch were added at 6
+    and 7 and the heading moved to 8. HEADING is kept as an alias of YAW so the
+    feature builders that index through this enum follow the move on their own
+    -- but anything still reaching for a bare column 6 now gets roll.
+    """
 
     _X = 0
     _Y = 1
@@ -54,16 +61,16 @@ class BoundingBoxIndex(IntEnum):
     _LENGTH = 3
     _WIDTH = 4
     _HEIGHT = 5
-    _HEADING = 6
+    _ROLL = 6
+    _PITCH = 7
+    _YAW = 8
+    _HEADING = 8  # alias of _YAW: the name the log format used before roll/pitch
 
     @classmethod
     def size(cls):
-        valid_attributes = [
-            attribute
-            for attribute in dir(cls)
-            if attribute.startswith("_") and not attribute.startswith("__") and not callable(getattr(cls, attribute))
-        ]
-        return len(valid_attributes)
+        # Counted off the last column rather than by walking dir(cls), which
+        # sees _HEADING and _YAW as two entries and would report one too many.
+        return cls._YAW + 1
 
     @classmethod
     @property
@@ -97,8 +104,29 @@ class BoundingBoxIndex(IntEnum):
 
     @classmethod
     @property
+    def ROLL(cls):
+        return cls._ROLL
+
+    @classmethod
+    @property
+    def PITCH(cls):
+        return cls._PITCH
+
+    @classmethod
+    @property
+    def YAW(cls):
+        return cls._YAW
+
+    @classmethod
+    @property
     def HEADING(cls):
         return cls._HEADING
+
+    @classmethod
+    @property
+    def ORIENTATION(cls):
+        # assumes ROLL, PITCH, YAW have subsequent indices
+        return slice(cls._ROLL, cls._YAW + 1)
 
     @classmethod
     @property

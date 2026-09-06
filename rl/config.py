@@ -29,7 +29,7 @@ class RLConfig:
     # /nfshomes home, so Path.home() would resolve differently in the two contexts.
     metric_cache_path: Path = field(
         default_factory=lambda: Path(
-            os.getenv("RAP_METRIC_CACHE", _devkit_root().parent / "DrivoR" / "exp" / "train_metric_cache")
+            os.getenv("RAP_METRIC_CACHE", _devkit_root().parent / "RAP" / "exp" / "train_metric_cache")
         )
     )
 

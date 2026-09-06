@@ -16,6 +16,7 @@ from nuplan.common.geometry.transform import translate_longitudinally
 from navsim.common.dataclasses import Frame, Annotations, Trajectory, Lidar
 from navsim.common.enums import BoundingBoxIndex, LidarIndex
 from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
+from navsim.visualization.boxes import HEIGHT, LENGTH, WIDTH, X, Y, YAW, as_rpy
 from navsim.visualization.lidar import filter_lidar_pc, get_lidar_pc_color
 from navsim.visualization.config import BEV_PLOT_CONFIG, MAP_LAYER_CONFIG, AGENT_CONFIG, LIDAR_CONFIG
 
@@ -50,15 +51,19 @@ def add_annotations_to_bev_ax(ax: plt.Axes, annotations: Annotations, add_ego: b
     :return: ax with plot
     """
 
-    for name_value, box_value in zip(annotations.names, annotations.boxes):
+    # A bird's-eye view is an SE(2) picture: an OrientedBox carries one angle,
+    # so roll and pitch have nowhere to go here and only the yaw is read. The
+    # footprint of a rolled or pitched box is not quite its l x w rectangle, but
+    # nothing downstream of this plot depends on that.
+    for name_value, box_value in zip(annotations.names, as_rpy(annotations.boxes)):
         agent_type = tracked_object_types[name_value]
 
         x, y, heading = (
-            box_value[0],
-            box_value[1],
-            box_value[6],
+            box_value[X],
+            box_value[Y],
+            box_value[YAW],
         )
-        box_length, box_width, box_height = box_value[3], box_value[4], box_value[5]
+        box_length, box_width, box_height = box_value[LENGTH], box_value[WIDTH], box_value[HEIGHT]
         agent_box = OrientedBox(StateSE2(x, y, heading), box_length, box_width, box_height)
 
         add_oriented_box_to_bev_ax(ax, agent_box, AGENT_CONFIG[agent_type])

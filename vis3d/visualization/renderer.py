@@ -5,9 +5,11 @@ import numpy as np
 from tqdm import tqdm
 from numpy import array
 import math
+import sys
+from pathlib import Path
 
-from navsim.visualization.boxes import CENTER, DIMS, RPY, as_rpy, rpy_to_rot
-
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import box_schema
 
 def build_se3(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     """4×4 SE(3) 齐次矩阵"""
@@ -29,6 +31,18 @@ COLOR_TABLE = {
     'vehicle': np.array([0, 128, 255], np.uint8),  # 蓝
     'bicycle': np.array([255, 255, 0], np.uint8),  # 黑
 }
+
+def rpy_to_rot(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """R = Rz(yaw) @ Ry(pitch) @ Rx(roll); equals yaw_to_rot when roll=pitch=0."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp,     cp * sr,                cp * cr],
+    ], dtype=np.float32)
+
 
 def yaw_to_rot(yaw: float) -> np.ndarray:
     c, s = math.cos(yaw), math.sin(yaw)
@@ -143,6 +157,35 @@ COLOR_TABLE = {
     'vehicle': np.array([0, 128, 255], np.uint8),  # 蓝
     'bicycle': np.array([255, 255, 0], np.uint8),  # 黑
 }
+
+# Traffic lights are drawn as upright cuboids of fixed size (they are too
+# small and too self-similar to fit an extent to), so the only thing that
+# distinguishes one from another on the canvas is the colour of its state.
+TRAFFIC_LIGHT_DIMS = (0.5, 0.5, 1.0)   # (L, W, H) in metres
+TRAFFIC_LIGHT_BASE_HEIGHT = 5.0        # bottom face above the ground, in metres
+
+
+def traffic_light_color(state):
+    """COLOR_TABLE entry for a traffic-light state, as an RGB list.
+
+    Accepts either a state name ('red'/'yellow'/'green'/'unknown'), as the
+    video pipeline reads off the frame pixels, or nuPlan's is_red bool, which
+    only distinguishes red from not-red. Anything unrecognised draws white
+    rather than guessing a colour the state doesn't support.
+    """
+    if isinstance(state, (bool, np.bool_)):
+        state = 'red' if state else 'green'
+    return COLOR_TABLE.get(f'traffic_light_{state}',
+                           COLOR_TABLE['traffic_light_unknown']).tolist()
+
+
+def draw_traffic_light(canvas, position, T_w2c, K, state,
+                       dims=TRAFFIC_LIGHT_DIMS):
+    """Fills a fixed-size upright cuboid at `position` (its bottom-face centre,
+    in the same frame T_w2c maps from) in the colour of its state."""
+    draw_cuboid_at(canvas, position, dims, T_w2c, K,
+                   color_rgb=traffic_light_color(state), thickness=-1)
+
 
 def save_as_video(img_list, save_path):
     # 确定视频的保存路径和帧率
@@ -362,16 +405,86 @@ def draw_polygon_depth(canvas: np.ndarray,
     cv2.fillConvexPoly(canvas, hull_uv, col)
 
 
+# Pixel coordinates are clamped to this before rasterising. Off-screen corners
+# are legitimate -- a truncated object genuinely continues past the frame edge --
+# but a corner near the camera plane projects to a coordinate large enough to
+# overflow int32, which yields a garbage polygon rather than a clipped one.
+PIXEL_CLAMP = 100000
+
+
+def project_points_unclipped(points_cam, K):
+    """(N,3) camera-frame points -> (N,2) float pixel coords, off-image included.
+
+    Unlike project_points_cam this keeps points outside the frame instead of
+    flagging them invalid, because a cuboid may be mostly off-screen and still
+    have visible faces; only the near plane and PIXEL_CLAMP are enforced.
+    """
+    z = np.maximum(points_cam[:, 2], 1e-3)
+    u = K[0, 0] * points_cam[:, 0] / z + K[0, 2]
+    v = K[1, 1] * points_cam[:, 1] / z + K[1, 2]
+    return np.clip(np.stack([u, v], axis=1), -PIXEL_CLAMP, PIXEL_CLAMP)
+
+
+def poly_intersects_image(poly, width, height) -> bool:
+    """Whether a polygon's bounding box overlaps the canvas at all."""
+    return bool(poly[:, 0].max() >= 0 and poly[:, 0].min() < width and
+                poly[:, 1].max() >= 0 and poly[:, 1].min() < height)
+
+
+# A face is clipped against this plane before it is projected. A corner behind
+# the camera has no projection at all, and clamping its pixel coordinate
+# (project_points_unclipped) turns the face into a polygon whose edges sweep
+# across the frame instead of a clipped one; clipping in camera space keeps
+# exactly the part the camera can see. Not 0: a vertex left sitting on the
+# camera plane still divides by ~0 when projected.
+NEAR_PLANE_M = 0.05
+
+
+def clip_polygon_near(points_cam, near=NEAR_PLANE_M):
+    """Sutherland-Hodgman clip of a camera-frame polygon against z >= near.
+
+    Returns the (M, 3) visible part, empty when the polygon lies entirely
+    behind the near plane. Convexity is preserved, so the result is still safe
+    to hand to cv2.fillConvexPoly -- it just may have five corners instead of
+    four, where the plane cuts across a face.
+    """
+    points = np.asarray(points_cam, dtype=np.float64)
+    kept = []
+    for i in range(len(points)):
+        current, following = points[i], points[(i + 1) % len(points)]
+        current_in, following_in = current[2] >= near, following[2] >= near
+        if current_in:
+            kept.append(current)
+        if current_in != following_in:
+            t = (near - current[2]) / (following[2] - current[2])
+            kept.append(current + t * (following - current))
+    return np.array(kept, dtype=np.float64) if kept else np.empty((0, 3))
+
+
 def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
     """
     在一张 canvas（H×W×3）上，将所有车辆的 3D 立方体面进行深度排序后填充：
     - 使用低饱和度的“粉彩”式颜色作为每个面的基础色，
     - 并根据面到相机的平均深度做线性颜色衰减（越远越暗）。
-    - bboxes: 形状为 (N, 9) 的数组，每一行为 [x, y, z, L, W, H, roll, pitch, yaw]；
-              旧的 (N, 7) 格式（末位是 yaw）同样接受，roll/pitch 按 0 处理。
+    - bboxes: 形状为 (N, >=7) 的数组。每一行至少包含 [x, y, z, L, W, H, yaw, ...]
     - T_w2c: 4×4 世界到相机的变换矩阵
     - K:      3×3 相机内参
     - depth_max: 用于裁剪深度时的最大深度（如果 Z 超过该值，就当作 depth_max 处理）
+
+    Objects are ordered as wholes, by the depth of their nearest corner, and
+    only then are one object's own faces ordered among themselves. Sorting
+    every face of every object into one list -- which is what this used to do
+    -- lets two objects interleave, and that is not a thing solid vehicles can
+    do: a distant car whose box fell inside the long axis of a nearer van's
+    box was drawn over the van's far face, so the small far box sat on top of
+    the big near one. Face-level sorting is only needed for geometry that can
+    interpenetrate; within one convex box, back-to-front by mean depth is
+    exact.
+
+    The nearest corner rather than the centre decides the order because these
+    boxes vary hugely in length: a 9 m van and a 2 m car can share a centre
+    depth to within 10 cm while the van's nose is 4 m nearer, and it is the
+    nose that the viewer sees in front.
     """
     H, W = canvas.shape[:2]
 
@@ -396,16 +509,15 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
         [4, 5, 6, 7],  # bottom面
     ]
 
-    # ---- 3) 收集所有要绘制的“面” ----
-    faces_to_draw = []  # 列表中每项：{'poly': np.int32((4,2)), 'depth': float, 'base_color': (B,G,R)}
+    # ---- 3) 收集所有要绘制的“物体”，每个带自己的面 ----
+    objects_to_draw = []  # 每项：{'near': float, 'faces': [{'poly', 'depth', 'base_color'}]}
 
-    bboxes = as_rpy(bboxes)   # 统一成 (N, 9)，旧的 7 列格式在此补齐 roll/pitch
     num_vehicles = bboxes.shape[0]
     for vi in range(num_vehicles):
         info = bboxes[vi]
-        pos   = info[CENTER]              # (x, y, z)
-        L, Wd, H_box = info[DIMS]         # 长、宽、高
-        roll, pitch, yaw = info[RPY]      # 滚转、俯仰、偏航
+        pos   = info[box_schema.CENTER]              # (x, y, z)
+        L, Wd, H_box = info[box_schema.DIMS]         # 长、宽、高
+        roll, pitch, yaw = info[box_schema.RPY]      # 滚转、俯仰、偏航
 
         # 3.1) 局部角点，(8,3)
         corners_loc = vehicle_corners_local(L, Wd, H_box)
@@ -417,43 +529,65 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
         # 3.3) 转到相机坐标系
         pts_cam = (T_w2c[:3, :3] @ corners_world.T + T_w2c[:3, 3:4]).T  # (8,3)
 
-        # 3.4) 投影到像素平面，得到 uv 以及 valid mask
-        uv, valid = project_points_cam(pts_cam, K, (H, W))  # uv: (8,2)，valid: (8,)
+        # 3.4) 投影到像素平面（保留画面外的角点）
+        uv = project_points_unclipped(pts_cam, K)  # (8,2) float
 
-        # 如果 8 个顶点里可见的少于 4 个，就跳过这辆车
-        if valid.sum() < 4:
+        # Skip only what cannot contribute a pixel: a box entirely behind the
+        # camera, or one whose whole silhouette misses the canvas. The old test
+        # here required 4 of the 8 corners to land *inside* the image, which
+        # dropped every correctly-placed truncated object -- a truck at the
+        # frame edge continues off-screen, so most of its corners are outside
+        # and it vanished entirely instead of being drawn clipped.
+        in_front = pts_cam[:, 2] > 1e-3
+        if not in_front.any() or not poly_intersects_image(uv[in_front], W, H):
             continue
 
         # 3.5) 遍历 6 个面，收集可绘制的面
+        faces = []
         for fi, idxs in enumerate(face_indices):
-            pts_cam_face = pts_cam[idxs]  # (4,3)
-            # 如果这个面所有顶点都在相机后方，就跳过
-            if np.all(pts_cam_face[:, 2] <= 0):
+            # Near-plane clip first: a face with a corner behind the camera has
+            # no meaningful projection until the invisible part is cut away.
+            poly_cam = clip_polygon_near(pts_cam[idxs])
+            if len(poly_cam) < 3:
                 continue
 
             # 计算这个面顶点的平均深度，并 clamp 到 [0, depth_max]
-            z_vals = pts_cam_face[:, 2].clip(0, depth_max)
+            z_vals = poly_cam[:, 2].clip(0, depth_max)
             z_mean = float(np.mean(z_vals))
 
-            # 只要这个面有至少一个顶点有效（落在图像内），就继续
-            if not np.any(valid[idxs]):
+            # 顶点在图像平面上的整数像素坐标
+            poly_2d = project_points_unclipped(poly_cam, K).astype(np.int32)
+
+            # Keep a face whose polygon overlaps the canvas even when none of its
+            # own corners is inside it -- a near, wide face can span the frame
+            # with all four corners beyond the edges. cv2.fillConvexPoly clips.
+            if not poly_intersects_image(poly_2d, W, H):
                 continue
 
-            # 顶点在图像平面上的整数像素坐标
-            poly_2d = np.array([uv[j] for j in idxs], dtype=np.int32)  # (4,2), dtype=int32
-
-            faces_to_draw.append({
+            faces.append({
                 'poly': poly_2d,
                 'depth': z_mean,
                 'base_color': base_face_colors[fi]
             })
 
-    # ---- 4) 根据 depth 从大（最远）到小（最近）排序 ----
-    faces_to_draw.sort(key=lambda x: x['depth'], reverse=True)
+        if not faces:
+            continue
+        # Straddling the camera plane gives a negative minimum; floored at 0 so
+        # such a box sorts as the nearest thing there is, which it is.
+        objects_to_draw.append({
+            'near': float(max(pts_cam[:, 2].min(), 0.0)),
+            'faces': faces,
+        })
+
+    # ---- 4) 物体从远到近排序，物体内部的面同样从远到近 ----
+    objects_to_draw.sort(key=lambda o: o['near'], reverse=True)
+    faces_to_draw = [face
+                     for obj in objects_to_draw
+                     for face in sorted(obj['faces'], key=lambda f: f['depth'], reverse=True)]
 
     # ---- 5) 按顺序绘制所有面，并做深度衰减（越远越暗） ----
     for face in faces_to_draw:
-        poly       = face['poly']         # (4,2) 的 int32
+        poly       = face['poly']         # (M,2) 的 int32
         depth_mean = face['depth']        # 平均深度
         base_B, base_G, base_R = face['base_color']
 
@@ -466,7 +600,6 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
         R = int(base_R * alpha)
 
         cv2.fillConvexPoly(canvas, poly, (B, G, R), cv2.LINE_AA)
-
 
 
 def vehicle_corners_local(L, W, H):
@@ -722,19 +855,10 @@ class ScenarioRenderer:
             for feat in scenario['traffic_lights']:
                 is_red = feat[1]
                 xy     = feat[2]     # [x, y]，注意还缺 z
-                z_base = 5         # 假设把信号灯底座离地 0.5m
-                pos_world = [xy[0], xy[1], z_base]
+                # 地图只给出信号灯所属车道的位置，没有高度，所以底座高度取固定值
+                pos_world = [xy[0], xy[1], TRAFFIC_LIGHT_BASE_HEIGHT]
 
-                # 设定长方体尺寸：宽 W=0.2m、长 L=0.2m、高 H=1.0m（可根据需要调整）
-                dims = (0.5, 0.5, 1.0)
-
-                # 颜色：红灯=红色，绿灯=绿色
-                if is_red:
-                    col = COLOR_TABLE['traffic_light_red'].tolist()
-                else:
-                    col = COLOR_TABLE['traffic_light_green'].tolist()
-
-                draw_cuboid_at(canvas, pos_world, dims, T_w2c, K, color_rgb=col, thickness=-1)
+                draw_traffic_light(canvas, pos_world, T_w2c, K, is_red)
 
             for feat in scenario['map_features'].values():
                 ftype = feat['type']

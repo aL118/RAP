@@ -18,7 +18,6 @@ from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 from shapely.geometry import Point as Point2D
 
 from navsim.common.dataclasses import AgentInput, Frame, Scene
-from navsim.visualization.boxes import X, Y, YAW, as_rpy
 from navsim.visualization.renderer import ScenarioRenderer
 
 CAMERA_CHANNELS = ("cam_f0", "cam_l0", "cam_l1", "cam_l2", "cam_r0", "cam_r1", "cam_r2", "cam_b0")
@@ -83,49 +82,68 @@ def _traffic_light_position(map_api, lane_connector_id, ego_pos, target_position
 
 def _boxes_ego_to_world(boxes, ego_yaw):
     """
-    navsim's Annotations.boxes are (x, y, z, l, w, h, roll, pitch, yaw), fully
-    in the ego frame: translated to the ego origin *and* rotated by -ego_yaw
-    (see create_openscene_metadata.py's `locs = inv_ego_r @ (translation -
-    ego_t)`, `rots = rots - ego_yaw`). ScenarioRenderer instead expects the
-    "world" convention that same script's `gt_boxes_world` uses: translated to
-    ego origin but NOT rotated -- world_to_camera_T applies the ego-heading
-    rotation itself, via its `lidar_yaw` argument. So invert navsim's rotation.
-
-    The ego pose is an SE(2): a yaw and nothing else. Undoing it therefore only
-    ever touches the box's yaw, and roll and pitch pass through as they are --
-    they are the object's own tilt in the ego frame, and no rotation about Z
-    changes them. That is exact here, not the approximation the yaw-only note
-    used to claim, because the transform being inverted is itself yaw-only.
+    navsim's Annotations.boxes are (x, y, z, l, w, h, heading), fully in the
+    ego frame: translated to the ego origin *and* rotated by -ego_yaw (see
+    create_openscene_metadata.py's `locs = inv_ego_r @ (translation - ego_t)`,
+    `rots = rots - ego_yaw`). ScenarioRenderer instead expects the "world"
+    convention that same script's `gt_boxes_world` uses: translated to ego
+    origin but NOT rotated -- world_to_camera_T applies the ego-heading
+    rotation itself, via its `lidar_yaw` argument. So invert navsim's rotation
+    (yaw-only; ignores any pitch/roll in the original 3D pose inverse, an
+    acceptable approximation for a visualization).
     """
-    boxes = as_rpy(boxes)   # copies, so the caller's annotations stay untouched
+    boxes = boxes.copy()
     c, s = np.cos(ego_yaw), np.sin(ego_yaw)
-    x, y = boxes[:, X].copy(), boxes[:, Y].copy()
-    boxes[:, X] = c * x - s * y
-    boxes[:, Y] = s * x + c * y
-    boxes[:, YAW] = boxes[:, YAW] + ego_yaw
+    x, y = boxes[:, 0].copy(), boxes[:, 1].copy()
+    boxes[:, 0] = c * x - s * y
+    boxes[:, 1] = s * x + c * y
+    boxes[:, 6] = boxes[:, 6] + ego_yaw
     return boxes
 
 
-def build_scenario_dict(scene: Scene, frame: Frame) -> dict:
-    """Builds the scenario dict ScenarioRenderer.observe() expects, from `frame`'s real (global) ego pose."""
-    ego_x, ego_y, ego_yaw = frame.ego_status.ego_pose
+def build_scenario_dict_from_values(map_api, ego_pose, boxes, names, traffic_lights) -> dict:
+    """
+    Builds the scenario dict ScenarioRenderer.observe() expects, from plain values
+    rather than a navsim Scene/Frame pair -- so callers that already hold a raw
+    openscene log dict (see scripts/vis3d/raster_navsim_log.py) can skip building
+    a Scene just to reach the same five fields.
+
+    :param map_api: nuplan-devkit map object for the frame's map_location
+    :param ego_pose: global (x, y, heading) of the ego, as Frame.ego_status.ego_pose
+    :param boxes: (N, 7) ego-frame boxes, as Annotations.boxes / anns['gt_boxes']
+    :param names: (N,) box class names, as Annotations.names / anns['gt_names']
+    :param traffic_lights: iterable of (lane_connector_id, is_red)
+    """
+    ego_x, ego_y, ego_yaw = ego_pose
     ego_pos = [float(ego_x), float(ego_y)]
     ego_yaw = float(ego_yaw)
-
-    gt_boxes_world = _boxes_ego_to_world(frame.annotations.boxes, ego_yaw)
 
     return {
         "ego_pos": ego_pos,
         "ego_heading": ego_yaw,
-        "map_features": _extract_map_features_lite(scene.map_api, ego_pos),
+        "map_features": _extract_map_features_lite(map_api, ego_pos),
         "traffic_lights": [
             (lane_id, is_red, pos)
-            for lane_id, is_red in frame.traffic_lights
-            for pos in [_traffic_light_position(scene.map_api, lane_id, ego_pos)]
+            for lane_id, is_red in traffic_lights
+            for pos in [_traffic_light_position(map_api, lane_id, ego_pos)]
             if pos is not None
         ],
-        "anns": {"gt_boxes_world": gt_boxes_world, "gt_names": frame.annotations.names},
+        "anns": {
+            "gt_boxes_world": _boxes_ego_to_world(np.asarray(boxes), ego_yaw),
+            "gt_names": names,
+        },
     }
+
+
+def build_scenario_dict(scene: Scene, frame: Frame) -> dict:
+    """Builds the scenario dict ScenarioRenderer.observe() expects, from `frame`'s real (global) ego pose."""
+    return build_scenario_dict_from_values(
+        scene.map_api,
+        frame.ego_status.ego_pose,
+        frame.annotations.boxes,
+        frame.annotations.names,
+        frame.traffic_lights,
+    )
 
 
 def render_rasterized_views(scene: Scene, frame: Frame, camera_channels) -> dict:

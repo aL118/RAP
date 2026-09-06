@@ -9,6 +9,7 @@ from pyquaternion import Quaternion
 
 from navsim.common.dataclasses import Camera, Lidar, Annotations
 from navsim.common.enums import LidarIndex, BoundingBoxIndex
+from navsim.visualization.boxes import CENTER, DIMS, HEIGHT, LENGTH, RPY, WIDTH, as_rpy, rpy_to_rot
 from navsim.visualization.config import AGENT_CONFIG
 from navsim.visualization.lidar import filter_lidar_pc, get_lidar_pc_color
 from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
@@ -71,6 +72,10 @@ def add_annotations_to_camera_ax(ax: plt.Axes, camera: Camera, annotations: Anno
         camera.sensor2lidar_rotation,
         camera.sensor2lidar_translation,
     )
+    # NB: `boxes` here is _transform_annotations_to_camera's own camera-frame
+    # layout -- [x, y, z, l, h, w, heading], seven wide with one angle -- not
+    # the nine-column annotation row. Column 6 is the heading in this layout,
+    # so BoundingBoxIndex/RPY deliberately do not apply.
     box_positions, box_dimensions, box_heading = (
         boxes[:, slice(0, 2 + 1)],
         boxes[:, slice(3, 5 + 1)],
@@ -110,17 +115,23 @@ def _transform_annotations_to_camera(
     :return: bounding boxes in camera coordinates
     """
 
+    boxes = as_rpy(boxes)
     locs, rots = (
-        boxes[:, slice(0, 2 + 1)],
-        boxes[:, 6 :],
+        boxes[:, CENTER],
+        boxes[:, RPY],
     )
     dims_cam = boxes[
-        :, [3, 5, 4]
+        :, [LENGTH, HEIGHT, WIDTH]
     ]  # l, w, h -> l, h, w
 
-    rots_cam = np.zeros_like(rots)
-    for idx, rot in enumerate(rots):
-        rot = Quaternion(axis=[0, 0, 1], radians=rot)
+    # One heading per box on the way out, as _plot_rect_3d_on_img's corner
+    # builder rotates about a single axis. Roll and pitch are folded into the
+    # quaternion before it is resolved back to a heading, so a tilted box now
+    # lands on the yaw the camera actually sees rather than on its ego-frame
+    # yaw; for the roll = pitch = 0 rows this is the previous result exactly.
+    rots_cam = np.zeros((len(boxes), 1), dtype=boxes.dtype)
+    for idx, (roll, pitch, yaw) in enumerate(rots):
+        rot = Quaternion(matrix=rpy_to_rot(roll, pitch, yaw), rtol=1e-6, atol=1e-6)
         rot = Quaternion(matrix=sensor2lidar_rotation).inverse * rot
         rots_cam[idx] = -rot.yaw_pitch_roll[0]
 

@@ -1,0 +1,390 @@
+<meta charset="utf-8">
+<title>manual boxes</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+         background: #14161a; color: #e6e8ea; height: 100vh; display: flex; }
+  #left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #side { width: 280px; border-left: 1px solid #2b2f36; padding: 12px;
+          overflow-y: auto; background: #171a1f; }
+  #stage { flex: 1; min-height: 0; position: relative; background: #0d0f12; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+  #bar { padding: 8px 12px; border-top: 1px solid #2b2f36; background: #171a1f; }
+  #timeline { position: relative; height: 26px; margin-top: 6px; cursor: pointer;
+              background: #0d0f12; border-radius: 3px; overflow: hidden; }
+  #timeline div { position: absolute; top: 0; bottom: 0; }
+  .tl-det   { background: #3d4c5c; }
+  .tl-int   { background: #2f6b4f; }
+  .tl-key   { background: #4ade80; }
+  .tl-now   { background: #e6e8ea; width: 2px !important; z-index: 3; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+       color: #8b939c; margin: 0 0 8px; font-weight: 600; }
+  .track { border: 1px solid #2b2f36; border-radius: 4px; padding: 8px;
+           margin-bottom: 6px; cursor: pointer; }
+  .track.sel { border-color: #4ade80; background: #1b2a22; }
+  .track select { width: 100%; margin-top: 4px; background: #0d0f12; color: inherit;
+                  border: 1px solid #2b2f36; border-radius: 3px; padding: 3px; }
+  .row { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+  button { background: #23272e; color: #e6e8ea; border: 1px solid #343a43;
+           border-radius: 4px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { background: #2b3038; }
+  button.primary { background: #16653c; border-color: #1c7d4a; }
+  button:disabled { opacity: .4; cursor: default; }
+  #status { margin-top: 8px; color: #8b939c; min-height: 2.4em; }
+  kbd { background: #23272e; border: 1px solid #343a43; border-radius: 3px;
+        padding: 0 4px; font: 11px ui-monospace, monospace; }
+  #help { color: #6b7480; font-size: 11px; margin-top: 10px; line-height: 1.7; }
+  #head { padding: 8px 12px; border-bottom: 1px solid #2b2f36; background: #171a1f;
+          display: flex; gap: 14px; align-items: center; }
+  #frameno { font: 12px ui-monospace, monospace; color: #8b939c; }
+</style>
+
+<div id="left">
+  <div id="head">
+    <strong id="clipname">…</strong>
+    <span id="frameno"></span>
+    <button id="prev">◀</button>
+    <button id="next">▶</button>
+    <label style="color:#8b939c"><input type="checkbox" id="showdet" checked> detector boxes</label>
+  </div>
+  <div id="stage"><canvas id="cv"></canvas></div>
+  <div id="bar">
+    <div class="row">
+      <span style="color:#8b939c">
+        <span style="color:#4ade80">■</span> keyframe
+        <span style="color:#2f6b4f">■</span> interpolated
+        <span style="color:#3d4c5c">■</span> detector
+        <span style="color:#ef4444">■</span> reject
+      </span>
+      <span id="counts" style="color:#8b939c"></span>
+    </div>
+    <div id="timeline"></div>
+  </div>
+</div>
+
+<div id="side">
+  <h2>Tracks</h2>
+  <div id="tracks"></div>
+  <button id="addtrack" style="width:100%">+ new track</button>
+  <button id="addreject" style="width:100%; margin-top:4px">+ reject region</button>
+
+  <h2 style="margin-top:16px">This frame</h2>
+  <div class="row">
+    <button id="gone" style="flex:1">mark gone</button>
+    <button id="delkey" style="flex:1">drop keyframe</button>
+  </div>
+  <button id="deltrack" style="width:100%; margin-top:6px">delete track</button>
+
+  <h2 style="margin-top:16px">Save</h2>
+  <button id="save" class="primary" style="width:100%">save manual_boxes.json</button>
+  <div id="status"></div>
+
+  <div id="help">
+    <kbd>←</kbd> <kbd>→</kbd> frame &nbsp; <kbd>shift</kbd>+ jump 10<br>
+    <kbd>n</kbd> new track &nbsp; <kbd>r</kbd> reject region<br>
+    <kbd>g</kbd> mark gone<br>
+    <kbd>del</kbd> drop keyframe &nbsp; <kbd>s</kbd> save<br>
+    drag on empty canvas draws a box for the<br>
+    selected track; drag inside moves it; drag a<br>
+    corner resizes. Any edit makes this frame a<br>
+    keyframe. Frames between two keyframes are<br>
+    interpolated; a track shows nothing before its<br>
+    first or after its last keyframe.<br><br>
+    A <b style="color:#ef4444">reject region</b> deletes instead of adding:<br>
+    every detector box it covers is dropped and it<br>
+    contributes none of its own. Use it on a false<br>
+    positive -- the bonnet, a hedge read as a car --<br>
+    where drawing over would only swap your box in<br>
+    for theirs.
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const cv = $('#cv'), ctx = cv.getContext('2d');
+let META = null, FRAMES = [], DET = {}, CATS = [];
+let tracks = [], sel = null, fi = 0, nextId = 1, dirty = false;
+const imgCache = new Map();
+
+const PALETTE = ['#4ade80','#60a5fa','#f472b6','#fbbf24','#a78bfa','#fb7185','#34d399','#e879f9'];
+const REJECT = '#ef4444';
+// One colour for every reject region rather than a walk through the palette:
+// they are not objects and have no identity worth telling apart on the canvas,
+// and red reads as deletion where a green box reads as an annotation.
+const colorOf = t => t.reject ? REJECT : PALETTE[(t.id - 1) % PALETTE.length];
+
+// ---- track model -----------------------------------------------------------
+// A track is a category plus keyframes: frame name -> box, or null meaning the
+// object is gone from that frame on. Everything else is derived, so there is
+// one source of truth for what will be saved and what is drawn.
+function keyIdx(track) {
+  return Object.keys(track.keyframes)
+    .map(f => FRAMES.indexOf(f)).filter(i => i >= 0).sort((a, b) => a - b);
+}
+function boxAt(track, i) {
+  const f = FRAMES[i];
+  if (f in track.keyframes) return track.keyframes[f];
+  const ks = keyIdx(track);
+  let lo = -1, hi = -1;
+  for (const k of ks) { if (k < i) lo = k; else { hi = k; break; } }
+  if (lo < 0 || hi < 0) return null;                 // no extrapolation
+  const a = track.keyframes[FRAMES[lo]], b = track.keyframes[FRAMES[hi]];
+  if (a === null || b === null) return null;         // gap is a real absence
+  const t = (i - lo) / (hi - lo);
+  return a.map((v, k) => v + t * (b[k] - v));
+}
+function isKey(track, i) { return FRAMES[i] in track.keyframes; }
+
+// ---- canvas ----------------------------------------------------------------
+let view = { s: 1, dx: 0, dy: 0 };   // image -> canvas
+const toImg = (x, y) => [(x - view.dx) / view.s, (y - view.dy) / view.s];
+const toCv  = (x, y) => [x * view.s + view.dx, y * view.s + view.dy];
+
+function frameImage(i) {
+  const name = FRAMES[i];
+  if (imgCache.has(name)) return imgCache.get(name);
+  const img = new Image();
+  img.src = '/frames/' + encodeURIComponent(name);
+  img.onload = () => { if (FRAMES[fi] === name) draw(); };
+  imgCache.set(name, img);
+  if (imgCache.size > 400) imgCache.delete(imgCache.keys().next().value);
+  return img;
+}
+
+function draw() {
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+
+  const img = frameImage(fi);
+  if (!img.complete || !img.naturalWidth) return;
+  view.s = Math.min(r.width / img.naturalWidth, r.height / img.naturalHeight);
+  view.dx = (r.width - img.naturalWidth * view.s) / 2;
+  view.dy = (r.height - img.naturalHeight * view.s) / 2;
+  ctx.drawImage(img, view.dx, view.dy, img.naturalWidth * view.s, img.naturalHeight * view.s);
+
+  if ($('#showdet').checked) {
+    ctx.lineWidth = 1; ctx.setLineDash([4, 3]); ctx.strokeStyle = '#7c8ea0';
+    ctx.font = '11px ui-monospace, monospace'; ctx.fillStyle = '#7c8ea0';
+    for (const d of (DET[FRAMES[fi]] || [])) {
+      const [x0, y0] = toCv(d.box[0], d.box[1]), [x1, y1] = toCv(d.box[2], d.box[3]);
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.fillText(`${d.category} ${d.score}`, x0 + 3, y0 - 4);
+    }
+    ctx.setLineDash([]);
+  }
+
+  for (const t of tracks) {
+    const b = boxAt(t, fi);
+    if (!b) continue;
+    const [x0, y0] = toCv(b[0], b[1]), [x1, y1] = toCv(b[2], b[3]);
+    const on = t === sel, key = isKey(t, fi);
+    ctx.strokeStyle = colorOf(t); ctx.lineWidth = on ? 2.5 : 1.5;
+    ctx.setLineDash(key ? [] : [6, 4]);
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.setLineDash([]);
+    // A wash over a reject region, so what it will delete is obvious at the
+    // glance that matters -- whether it actually covers the bad box -- rather
+    // than needing the label to be read.
+    if (t.reject) {
+      ctx.fillStyle = 'rgba(239,68,68,0.14)';
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    }
+    ctx.fillStyle = colorOf(t);
+    ctx.font = on ? 'bold 12px ui-sans-serif' : '12px ui-sans-serif';
+    ctx.fillText(`#${t.id} ${t.reject ? 'REJECT' : t.category}${key ? '' : ' (interp)'}`,
+                 x0 + 3, y0 - 5);
+    if (on) for (const [hx, hy] of corners(x0, y0, x1, y1)) {
+      ctx.fillRect(hx - 4, hy - 4, 8, 8);
+    }
+  }
+}
+const corners = (x0, y0, x1, y1) => [[x0,y0],[x1,y0],[x0,y1],[x1,y1]];
+
+// ---- editing ---------------------------------------------------------------
+let drag = null;
+cv.addEventListener('pointerdown', e => {
+  if (!sel) { setStatus('select or add a track first'); return; }
+  const r = cv.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const [ix, iy] = toImg(cx, cy);
+  const b = boxAt(sel, fi);
+  if (b) {
+    const [x0, y0] = toCv(b[0], b[1]), [x1, y1] = toCv(b[2], b[3]);
+    const hit = corners(x0, y0, x1, y1).findIndex(([hx, hy]) =>
+      Math.abs(hx - cx) <= 6 && Math.abs(hy - cy) <= 6);
+    if (hit >= 0) drag = { mode: 'resize', corner: hit, box: b.slice() };
+    else if (ix >= b[0] && ix <= b[2] && iy >= b[1] && iy <= b[3])
+      drag = { mode: 'move', ox: ix, oy: iy, box: b.slice() };
+  }
+  if (!drag) drag = { mode: 'new', ox: ix, oy: iy, box: [ix, iy, ix, iy] };
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const r = cv.getBoundingClientRect();
+  const [ix, iy] = toImg(e.clientX - r.left, e.clientY - r.top);
+  const b = drag.box;
+  if (drag.mode === 'new') drag.cur = [Math.min(drag.ox, ix), Math.min(drag.oy, iy),
+                                       Math.max(drag.ox, ix), Math.max(drag.oy, iy)];
+  else if (drag.mode === 'move') {
+    const dx = ix - drag.ox, dy = iy - drag.oy;
+    drag.cur = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy];
+  } else {
+    const c = drag.corner, n = b.slice();
+    if (c === 0) { n[0] = ix; n[1] = iy; } else if (c === 1) { n[2] = ix; n[1] = iy; }
+    else if (c === 2) { n[0] = ix; n[3] = iy; } else { n[2] = ix; n[3] = iy; }
+    drag.cur = [Math.min(n[0], n[2]), Math.min(n[1], n[3]),
+                Math.max(n[0], n[2]), Math.max(n[1], n[3])];
+  }
+  sel.keyframes[FRAMES[fi]] = drag.cur.map(v => Math.round(v * 10) / 10);
+  draw();
+});
+cv.addEventListener('pointerup', () => {
+  if (!drag) return;
+  const b = sel.keyframes[FRAMES[fi]];
+  // A click that never became a drag would otherwise leave a zero-area
+  // keyframe, which the server rejects on save -- long after the click.
+  if (!b || b[2] - b[0] < 2 || b[3] - b[1] < 2) delete sel.keyframes[FRAMES[fi]];
+  else markDirty();
+  drag = null; render();
+});
+
+// ---- ui --------------------------------------------------------------------
+function setStatus(msg, bad) {
+  $('#status').textContent = msg;
+  $('#status').style.color = bad ? '#fb7185' : '#8b939c';
+}
+function markDirty() { dirty = true; $('#save').textContent = 'save manual_boxes.json *'; }
+
+function renderTracks() {
+  const host = $('#tracks'); host.innerHTML = '';
+  for (const t of tracks) {
+    const div = document.createElement('div');
+    div.className = 'track' + (t === sel ? ' sel' : '');
+    const n = Object.values(t.keyframes).filter(v => v !== null).length;
+    div.innerHTML = `<div class="row"><span style="color:${colorOf(t)}">#${t.id}</span>
+        <span style="color:#8b939c">${n} kf</span></div>`;
+    if (t.reject) {
+      // No category select: a reject region names no object. The word stands in
+      // for the dropdown so the row is still the same height and the panel does
+      // not jump as regions are added and removed.
+      const tag = document.createElement('div');
+      tag.textContent = 'reject region';
+      tag.style.cssText = `color:${REJECT}; font-size:12px; padding:3px 1px`;
+      div.appendChild(tag);
+    } else {
+      const s = document.createElement('select');
+      for (const c of CATS) {
+        const o = document.createElement('option');
+        o.value = o.textContent = c; if (c === t.category) o.selected = true;
+        s.appendChild(o);
+      }
+      s.onchange = () => { t.category = s.value; markDirty(); };
+      s.onclick = e => e.stopPropagation();
+      div.appendChild(s);
+    }
+    div.onclick = () => { sel = t; render(); };
+    host.appendChild(div);
+  }
+}
+function renderTimeline() {
+  const tl = $('#timeline'); tl.innerHTML = '';
+  const w = tl.clientWidth || 1, step = w / FRAMES.length;
+  const add = (i, cls, h) => {
+    const d = document.createElement('div');
+    d.className = cls; d.style.left = (i * step) + 'px';
+    d.style.width = Math.max(step, 2) + 'px';
+    if (h) { d.style.top = h[0]; d.style.bottom = h[1]; }
+    tl.appendChild(d);
+  };
+  FRAMES.forEach((f, i) => { if ((DET[f] || []).length) add(i, 'tl-det', ['0', '60%']); });
+  for (const t of tracks) FRAMES.forEach((f, i) => {
+    if (isKey(t, i) && t.keyframes[f] !== null) add(i, 'tl-key', ['55%', '0']);
+    else if (boxAt(t, i)) add(i, 'tl-int', ['70%', '0']);
+  });
+  add(fi, 'tl-now');
+}
+function render() {
+  $('#frameno').textContent = `${FRAMES[fi]}  (${fi + 1}/${FRAMES.length})`;
+  const drawn = tracks.filter(t => boxAt(t, fi)).length;
+  $('#counts').textContent =
+    `${tracks.length} track(s) · ${drawn} box(es) here · ${(DET[FRAMES[fi]] || []).length} detector`;
+  $('#gone').disabled = $('#delkey').disabled = $('#deltrack').disabled = !sel;
+  renderTracks(); renderTimeline(); draw();
+}
+function go(d) { fi = Math.max(0, Math.min(FRAMES.length - 1, fi + d)); render();
+                 for (let k = 1; k <= 3; k++) frameImage(Math.min(FRAMES.length - 1, fi + k)); }
+
+$('#prev').onclick = () => go(-1);
+$('#next').onclick = () => go(1);
+$('#showdet').onchange = render;
+$('#addtrack').onclick = () => {
+  sel = { id: nextId++, category: CATS.includes('car') ? 'car' : CATS[0],
+          reject: false, keyframes: {} };
+  tracks.push(sel); markDirty(); render();
+};
+$('#addreject').onclick = () => {
+  sel = { id: nextId++, category: null, reject: true, keyframes: {} };
+  tracks.push(sel); markDirty(); render();
+};
+$('#gone').onclick = () => { sel.keyframes[FRAMES[fi]] = null; markDirty(); render(); };
+$('#delkey').onclick = () => { delete sel.keyframes[FRAMES[fi]]; markDirty(); render(); };
+$('#deltrack').onclick = () => {
+  tracks = tracks.filter(t => t !== sel); sel = tracks[0] || null; markDirty(); render();
+};
+$('#timeline').onclick = e => {
+  const r = e.currentTarget.getBoundingClientRect();
+  fi = Math.min(FRAMES.length - 1,
+                Math.max(0, Math.floor((e.clientX - r.left) / r.width * FRAMES.length)));
+  render();
+};
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  const jump = e.shiftKey ? 10 : 1;
+  if (e.key === 'ArrowLeft') go(-jump);
+  else if (e.key === 'ArrowRight') go(jump);
+  else if (e.key === 'n') $('#addtrack').click();
+  else if (e.key === 'r') $('#addreject').click();
+  else if (e.key === 'g' && sel) $('#gone').click();
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) $('#delkey').click();
+  else if (e.key === 's') { e.preventDefault(); $('#save').click(); }
+  else return;
+  e.preventDefault();
+});
+addEventListener('resize', render);
+addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+$('#save').onclick = async () => {
+  const payload = { tracks: tracks.map(t => ({ id: t.id,
+                                               category: t.reject ? null : t.category,
+                                               reject: !!t.reject,
+                                               keyframes: t.keyframes })) };
+  $('#save').disabled = true;
+  try {
+    const r = await fetch('/api/save', { method: 'POST', body: JSON.stringify(payload) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    dirty = false; $('#save').textContent = 'save manual_boxes.json';
+    setStatus(`saved ${j.tracks} track(s) to ${j.saved.split('/').slice(-3).join('/')}`);
+  } catch (err) { setStatus('save failed: ' + err.message, true); }
+  $('#save').disabled = false;
+};
+
+(async () => {
+  META = await (await fetch('/api/meta')).json();
+  FRAMES = META.frames; DET = META.detector || {}; CATS = META.categories;
+  $('#clipname').textContent = `${META.dataset}/${META.clip}${META.run ? '/' + META.run : ''}`;
+  if (META.manual && META.manual.tracks) {
+    tracks = META.manual.tracks.map(t => ({ id: t.id, category: t.category,
+                                            reject: !!t.reject,
+                                            keyframes: t.keyframes || {} }));
+    nextId = Math.max(0, ...tracks.map(t => t.id)) + 1;
+    sel = tracks[0] || null;
+    setStatus(`loaded ${tracks.length} existing track(s)`);
+  }
+  render();
+})();
+</script>

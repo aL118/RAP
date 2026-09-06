@@ -1,0 +1,409 @@
+<meta charset="utf-8">
+<title>3D box corrections</title>
+<style>
+  body { margin:0; display:flex; height:100vh; font:13px ui-sans-serif, system-ui;
+         background:#11151a; color:#dfe5ec; }
+  #left { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #head { display:flex; gap:8px; align-items:center; padding:6px 10px; background:#181e26; }
+  #stage { flex:1; position:relative; overflow:hidden; }
+  canvas { display:block; }
+  #side { width:310px; background:#181e26; padding:10px; overflow:auto; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#8b939c;
+       margin:0 0 6px; }
+  button { background:#232c38; color:#dfe5ec; border:1px solid #313c4a; border-radius:4px;
+           padding:4px 8px; cursor:pointer; font:12px ui-sans-serif; }
+  button:hover { background:#2c3745; }
+  button.primary { background:#2563eb; border-color:#2563eb; }
+  button.danger { background:#7f1d1d; border-color:#991b1b; }
+  .row { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+  .box { padding:5px 7px; border:1px solid #2a3441; border-radius:4px; margin-bottom:4px;
+         cursor:pointer; font:12px ui-monospace, monospace; }
+  .box.sel { border-color:#2563eb; background:#1b2735; }
+  .box.edited { border-left:3px solid #fbbf24; }
+  .box.added { border-left:3px solid #4ade80; }
+  #bev { background:#0d1116; border:1px solid #2a3441; border-radius:4px; }
+  #frameno { font:12px ui-monospace, monospace; color:#8b939c; }
+  #status { margin-top:8px; font-size:12px; color:#8b939c; min-height:2.4em; }
+  kbd { background:#232c38; border:1px solid #313c4a; border-radius:3px; padding:0 4px;
+        font:11px ui-monospace, monospace; }
+  #help { margin-top:10px; color:#7b848e; font-size:11px; line-height:1.6; }
+</style>
+
+<div id="left">
+  <div id="head">
+    <strong id="clipname">…</strong>
+    <span id="frameno"></span>
+    <button id="prev">◀</button>
+    <button id="next">▶</button>
+    <label style="color:#8b939c"><input type="checkbox" id="showall" checked> all boxes</label>
+  </div>
+  <div id="stage"><canvas id="cv"></canvas></div>
+</div>
+
+<div id="side">
+  <h2>Bird's eye</h2>
+  <canvas id="bev" width="290" height="290"></canvas>
+  <div style="color:#7b848e; font-size:11px; margin:4px 0 10px">
+    Ego at the bottom, looking up. Rings every 10 m. Drag a box here to move it —
+    depth error is invisible in the camera view and obvious here.
+  </div>
+
+  <h2>Boxes this frame</h2>
+  <div id="boxes"></div>
+  <div class="row" style="margin-top:6px">
+    <button id="add" style="flex:1">+ add box</button>
+    <button id="del" class="danger" style="flex:1">delete</button>
+  </div>
+  <div class="row">
+    <select id="cls" style="flex:1; background:#232c38; color:#dfe5ec; border:1px solid #313c4a;
+                            border-radius:4px; padding:4px"></select>
+    <button id="revert">revert</button>
+  </div>
+
+  <h2 style="margin-top:14px">Save</h2>
+  <button id="save" class="primary" style="width:100%">save manual_boxes_3d.json</button>
+  <div id="status"></div>
+
+  <div id="help">
+    <kbd>←</kbd><kbd>→</kbd> frame, <kbd>shift</kbd>+ jump 10<br>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move in the ground plane<br>
+    <kbd>R</kbd><kbd>F</kbd> raise / lower &nbsp; <kbd>Q</kbd><kbd>E</kbd> yaw<br>
+    <kbd>1</kbd><kbd>2</kbd> length &nbsp; <kbd>3</kbd><kbd>4</kbd> width &nbsp;
+    <kbd>5</kbd><kbd>6</kbd> height<br>
+    <kbd>shift</kbd> with any of those = coarse<br>
+    <kbd>N</kbd> add &nbsp; <kbd>Del</kbd> delete &nbsp; <kbd>Ctrl+S</kbd> save<br>
+    Click a box in either view to select it.
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const cv = $('#cv'), ctx = cv.getContext('2d');
+const bev = $('#bev'), bctx = bev.getContext('2d');
+let META, FRAMES = [], DATA = {}, CATS = [], EDITS = {};
+let fi = 0, sel = null, dirty = false;
+const imgCache = new Map();
+
+// A box is [x, y, z, length, width, height, yaw] in the ego frame: x forward,
+// y left, z up, yaw about z. Same convention as lift_frames_to_3d._fit_box.
+const STEP = { move: 0.25, z: 0.1, yaw: 2 * Math.PI / 180, size: 0.2 };
+
+// ---- geometry ---------------------------------------------------------------
+function corners(box) {
+  const [x, y, z, l, w, h, yaw] = box, c = Math.cos(yaw), s = Math.sin(yaw);
+  const out = [];
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+    const lx = sx * l / 2, ly = sy * w / 2, lz = sz * h / 2;
+    out.push([x + lx * c - ly * s, y + lx * s + ly * c, z + lz]);
+  }
+  return out;
+}
+// ego -> camera is the 4x4 in each frame's camera block; then a pinhole.
+function project(pt, cam) {
+  const E = cam.ego_to_camera, K = cam.intrinsics;
+  const X = E[0][0]*pt[0] + E[0][1]*pt[1] + E[0][2]*pt[2] + E[0][3];
+  const Y = E[1][0]*pt[0] + E[1][1]*pt[1] + E[1][2]*pt[2] + E[1][3];
+  const Z = E[2][0]*pt[0] + E[2][1]*pt[1] + E[2][2]*pt[2] + E[2][3];
+  if (Z <= 0.05) return null;                 // behind the lens: no projection
+  return [K[0][0]*X/Z + K[0][2], K[1][1]*Y/Z + K[1][2]];
+}
+const EDGES = [[0,1],[0,2],[1,3],[2,3],[4,5],[4,6],[5,7],[6,7],[0,4],[1,5],[2,6],[3,7]];
+
+// ---- state ------------------------------------------------------------------
+const frameName = () => FRAMES[fi];
+function entry() { return DATA[frameName()] || { boxes: [], names: [], scores: [] }; }
+function edits() { return EDITS[frameName()] || (EDITS[frameName()] = []); }
+
+// The working set for a frame: lifted boxes with their edits already applied,
+// so the canvas always shows what the merge would produce rather than what the
+// lift produced. Each entry remembers where it came from, which is what lets a
+// later edit be re-anchored to the original position rather than to the moved one.
+function working() {
+  const e = entry(), out = [];
+  const anchored = edits().filter(x => x.op !== 'add');
+  const used = new Set();
+  e.boxes.forEach((box, i) => {
+    let hit = null;
+    for (const ed of anchored) {
+      if (used.has(ed)) continue;
+      const d = Math.hypot(box[0]-ed.at[0], box[1]-ed.at[1], box[2]-ed.at[2]);
+      if (d < (ed.radius || 3.0)) { hit = ed; break; }
+    }
+    if (hit) {
+      used.add(hit);
+      if (hit.op === 'delete') return;
+      out.push({ box: hit.box.slice(), name: hit.name, edit: hit, origin: box.slice(),
+                 state: 'edited' });
+    } else {
+      out.push({ box: box.slice(), name: e.names[i], origin: box.slice(), state: 'lifted' });
+    }
+  });
+  for (const ed of edits()) if (ed.op === 'add')
+    out.push({ box: ed.box.slice(), name: ed.name, edit: ed, state: 'added' });
+  return out;
+}
+
+// Turning a lifted box into an edited one, or updating an existing edit.
+function commit(item) {
+  if (item.state === 'added') { item.edit.box = item.box.slice(); item.edit.name = item.name; }
+  else if (item.edit) { item.edit.box = item.box.slice(); item.edit.name = item.name; }
+  else {
+    item.edit = { op: 'replace', at: item.origin.slice(), radius: 3.0,
+                  box: item.box.slice(), name: item.name };
+    edits().push(item.edit);
+    item.state = 'edited';
+  }
+  markDirty();
+}
+
+function markDirty() { dirty = true; $('#save').textContent = 'save manual_boxes_3d.json *'; }
+function setStatus(m, bad) { $('#status').textContent = m; $('#status').style.color = bad ? '#f87171' : '#8b939c'; }
+
+// ---- drawing ----------------------------------------------------------------
+let view = { s: 1, dx: 0, dy: 0 };
+function frameImage(i) {
+  const name = FRAMES[i];
+  if (!imgCache.has(name)) {
+    const img = new Image();
+    img.onload = () => { if (FRAMES[fi] === name) draw(); };
+    img.src = '/frames/' + name;
+    imgCache.set(name, img);
+  }
+  return imgCache.get(name);
+}
+function draw() {
+  const r = $('#stage').getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  cv.style.width = r.width + 'px'; cv.style.height = r.height + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+  const img = frameImage(fi);
+  if (!img.complete || !img.naturalWidth) return;
+  view.s = Math.min(r.width / img.naturalWidth, r.height / img.naturalHeight);
+  view.dx = (r.width - img.naturalWidth * view.s) / 2;
+  view.dy = (r.height - img.naturalHeight * view.s) / 2;
+  ctx.drawImage(img, view.dx, view.dy, img.naturalWidth * view.s, img.naturalHeight * view.s);
+
+  const cam = entry().camera;
+  if (!cam) { ctx.fillStyle = '#f87171'; ctx.fillText('no camera for this frame', 12, 20); return; }
+  const items = working();
+  items.forEach((item, i) => {
+    if (!$('#showall').checked && i !== sel) return;
+    const pts = corners(item.box).map(p => project(p, cam));
+    if (pts.some(p => p === null)) return;
+    const on = i === sel;
+    ctx.lineWidth = on ? 2.5 : 1.4;
+    ctx.strokeStyle = on ? '#60a5fa'
+                    : item.state === 'added' ? '#4ade80'
+                    : item.state === 'edited' ? '#fbbf24' : '#94a3b8';
+    ctx.beginPath();
+    for (const [a, b] of EDGES) {
+      ctx.moveTo(view.dx + pts[a][0]*view.s, view.dy + pts[a][1]*view.s);
+      ctx.lineTo(view.dx + pts[b][0]*view.s, view.dy + pts[b][1]*view.s);
+    }
+    ctx.stroke();
+    const top = pts.reduce((m, p) => p[1] < m[1] ? p : m);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = (on ? 'bold ' : '') + '12px ui-sans-serif';
+    ctx.fillText(`${item.name} ${item.box[0].toFixed(0)}m`,
+                 view.dx + top[0]*view.s + 3, view.dy + top[1]*view.s - 4);
+  });
+  drawBev(items);
+}
+
+const BEV_RANGE = 60;      // metres ahead shown
+function bevXY(box) {      // ego x forward -> up the canvas, y left -> left
+  const k = bev.width / (2 * BEV_RANGE);
+  return [bev.width / 2 - box[1] * k, bev.height - box[0] * k * 2 * BEV_RANGE / BEV_RANGE / 2 * 2];
+}
+function bevPt(x, y) {
+  const k = bev.height / BEV_RANGE;
+  return [bev.width / 2 - y * (bev.width / (2 * BEV_RANGE)) * 2, bev.height - x * k];
+}
+function drawBev(items) {
+  bctx.clearRect(0, 0, bev.width, bev.height);
+  bctx.strokeStyle = '#1f2937'; bctx.fillStyle = '#4b5563'; bctx.font = '10px ui-monospace';
+  for (let r = 10; r <= BEV_RANGE; r += 10) {
+    const [, py] = bevPt(r, 0);
+    bctx.beginPath(); bctx.moveTo(0, py); bctx.lineTo(bev.width, py); bctx.stroke();
+    bctx.fillText(r + 'm', 3, py - 2);
+  }
+  const [ex, ey] = bevPt(0, 0);
+  bctx.fillStyle = '#e5e7eb';
+  bctx.beginPath(); bctx.moveTo(ex, ey - 8); bctx.lineTo(ex - 5, ey + 4);
+  bctx.lineTo(ex + 5, ey + 4); bctx.closePath(); bctx.fill();
+  items.forEach((item, i) => {
+    const [x, y, , l, w, , yaw] = item.box;
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const pts = [[l/2, w/2], [l/2, -w/2], [-l/2, -w/2], [-l/2, w/2]]
+      .map(([a, b]) => bevPt(x + a*c - b*s, y + a*s + b*c));
+    bctx.beginPath(); pts.forEach((p, k) => k ? bctx.lineTo(p[0], p[1]) : bctx.moveTo(p[0], p[1]));
+    bctx.closePath();
+    bctx.strokeStyle = i === sel ? '#60a5fa'
+                     : item.state === 'added' ? '#4ade80'
+                     : item.state === 'edited' ? '#fbbf24' : '#94a3b8';
+    bctx.lineWidth = i === sel ? 2 : 1; bctx.stroke();
+  });
+}
+
+// ---- picking and dragging ---------------------------------------------------
+function pickImage(mx, my) {
+  const cam = entry().camera; if (!cam) return null;
+  const items = working();
+  let best = null, bestArea = Infinity;
+  items.forEach((item, i) => {
+    const pts = corners(item.box).map(p => project(p, cam));
+    if (pts.some(p => p === null)) return;
+    const xs = pts.map(p => view.dx + p[0]*view.s), ys = pts.map(p => view.dy + p[1]*view.s);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    if (mx >= x0 && mx <= x1 && my >= y0 && my <= y1) {
+      const area = (x1-x0) * (y1-y0);            // smallest hit wins: a near box
+      if (area < bestArea) { bestArea = area; best = i; }   // must not swallow a far one
+    }
+  });
+  return best;
+}
+cv.onmousedown = e => {
+  const r = cv.getBoundingClientRect();
+  const hit = pickImage(e.clientX - r.left, e.clientY - r.top);
+  if (hit !== null) { sel = hit; render(); }
+};
+
+let drag = null;
+bev.onmousedown = e => {
+  const r = bev.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  const items = working();
+  let best = null, bestD = 24;
+  items.forEach((item, i) => {
+    const [px, py] = bevPt(item.box[0], item.box[1]);
+    const d = Math.hypot(px - mx, py - my);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  if (best === null) return;
+  sel = best; render();
+  const item = working()[sel];
+  drag = { item, mx, my, x: item.box[0], y: item.box[1] };
+};
+addEventListener('mousemove', e => {
+  if (!drag) return;
+  const r = bev.getBoundingClientRect();
+  const k = bev.height / BEV_RANGE, kx = (bev.width / (2 * BEV_RANGE)) * 2;
+  drag.item.box[0] = drag.x - ((e.clientY - r.top) - drag.my) / k;
+  drag.item.box[1] = drag.y - ((e.clientX - r.left) - drag.mx) / kx;
+  commit(drag.item); render();
+});
+addEventListener('mouseup', () => { drag = null; });
+
+// ---- panel ------------------------------------------------------------------
+function render() {
+  $('#frameno').textContent = `${frameName()}  (${fi + 1}/${FRAMES.length})`;
+  const items = working(), host = $('#boxes'); host.innerHTML = '';
+  if (sel !== null && sel >= items.length) sel = items.length ? items.length - 1 : null;
+  items.forEach((item, i) => {
+    const d = document.createElement('div');
+    d.className = 'box' + (i === sel ? ' sel' : '') +
+                  (item.state === 'edited' ? ' edited' : item.state === 'added' ? ' added' : '');
+    const [x, y, z, l, w, h, yaw] = item.box;
+    d.innerHTML = `${item.name} &nbsp; ${l.toFixed(1)}x${w.toFixed(1)}x${h.toFixed(1)}m<br>` +
+      `<span style="color:#7b848e">x ${x.toFixed(1)} y ${y.toFixed(1)} z ${z.toFixed(2)} ` +
+      `yaw ${(yaw * 180 / Math.PI).toFixed(0)}&deg;</span>`;
+    d.onclick = () => { sel = i; render(); };
+    host.appendChild(d);
+  });
+  if (!items.length) host.innerHTML = '<div style="color:#7b848e">none</div>';
+  const s = $('#cls');
+  if (sel !== null && items[sel]) s.value = items[sel].name;
+  draw();
+}
+
+function nudge(fn) {
+  const items = working();
+  if (sel === null || !items[sel]) return;
+  fn(items[sel].box);
+  commit(items[sel]); render();
+}
+$('#prev').onclick = () => go(-1);
+$('#next').onclick = () => go(1);
+$('#showall').onchange = render;
+function go(d) { fi = Math.max(0, Math.min(FRAMES.length - 1, fi + d)); sel = null; render();
+                 for (let k = 1; k <= 3; k++) frameImage(Math.min(FRAMES.length - 1, fi + k)); }
+
+$('#add').onclick = () => {
+  // 15 m ahead, on the ground, car-shaped and pointing where the ego points --
+  // a starting point to drag, not a guess about the scene.
+  const ed = { op: 'add', box: [15, 0, 0.75, 4.5, 1.8, 1.5, 0], name: $('#cls').value || 'car',
+               score: 1.0 };
+  edits().push(ed); markDirty();
+  sel = working().length - 1; render();
+};
+$('#del').onclick = () => {
+  const items = working();
+  if (sel === null || !items[sel]) return;
+  const item = items[sel];
+  if (item.state === 'added') edits().splice(edits().indexOf(item.edit), 1);
+  else if (item.edit) { item.edit.op = 'delete'; delete item.edit.box; }
+  else edits().push({ op: 'delete', at: item.origin.slice(), radius: 3.0 });
+  markDirty(); sel = null; render();
+};
+$('#revert').onclick = () => {
+  const items = working();
+  if (sel === null || !items[sel] || !items[sel].edit) return;
+  const list = edits(); list.splice(list.indexOf(items[sel].edit), 1);
+  markDirty(); sel = null; render();
+};
+$('#cls').onchange = () => {
+  const items = working();
+  if (sel === null || !items[sel]) return;
+  items[sel].name = $('#cls').value; commit(items[sel]); render();
+};
+
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  const big = e.shiftKey ? 4 : 1, k = e.key.toLowerCase();
+  if (e.key === 'ArrowLeft') return go(-(e.shiftKey ? 10 : 1)), e.preventDefault();
+  if (e.key === 'ArrowRight') return go(e.shiftKey ? 10 : 1), e.preventDefault();
+  if (k === 's' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); return $('#save').click(); }
+  const M = STEP.move * big, Z = STEP.z * big, Y = STEP.yaw * big, S = STEP.size * big;
+  const ops = {
+    w: b => b[0] += M, s: b => b[0] -= M, a: b => b[1] += M, d: b => b[1] -= M,
+    r: b => b[2] += Z, f: b => b[2] -= Z,
+    q: b => b[6] += Y, e: b => b[6] -= Y,
+    '1': b => b[3] = Math.max(0.2, b[3] - S), '2': b => b[3] += S,
+    '3': b => b[4] = Math.max(0.2, b[4] - S), '4': b => b[4] += S,
+    '5': b => b[5] = Math.max(0.2, b[5] - S), '6': b => b[5] += S,
+  };
+  if (ops[k]) { nudge(ops[k]); e.preventDefault(); return; }
+  if (k === 'n') { $('#add').click(); e.preventDefault(); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') { $('#del').click(); e.preventDefault(); }
+});
+addEventListener('resize', render);
+addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+$('#save').onclick = async () => {
+  const clean = {};
+  for (const [f, list] of Object.entries(EDITS)) if (list.length) clean[f] = list;
+  $('#save').disabled = true;
+  try {
+    const r = await fetch('/api/save3d', { method: 'POST', body: JSON.stringify({ edits: clean }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    dirty = false; $('#save').textContent = 'save manual_boxes_3d.json';
+    setStatus(`saved ${j.edits} edit(s) over ${j.frames} frame(s). Apply with\n` +
+              `apply_manual_boxes_3d.py --output_dir <run>`);
+  } catch (err) { setStatus('save failed: ' + err.message, true); }
+  $('#save').disabled = false;
+};
+
+(async () => {
+  META = await (await fetch('/api/meta3d')).json();
+  FRAMES = META.frames; DATA = META.boxes; CATS = META.categories;
+  EDITS = (META.manual && META.manual.edits) || {};
+  $('#clipname').textContent = `${META.dataset}/${META.clip}${META.run ? '/' + META.run : ''}`;
+  const s = $('#cls');
+  for (const c of CATS) { const o = document.createElement('option'); o.value = o.textContent = c; s.appendChild(o); }
+  s.value = CATS.includes('car') ? 'car' : CATS[0];
+  const n = Object.values(EDITS).reduce((a, b) => a + b.length, 0);
+  if (n) setStatus(`loaded ${n} existing edit(s)`);
+  render();
+})();
+</script>
