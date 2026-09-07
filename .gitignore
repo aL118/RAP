@@ -4,7 +4,6 @@
 exp/*
 *.pyc
 *.egg-info
-scripts/
 data/
 metric_cache
 cache
@@ -20,9 +19,9 @@ MySubmission
 **/raster_viz
 **/process_data/*.txt
 
-# Scratch. TMPDIR is pointed at tmp/<job id> by the run scripts; the bare
-# pymp-*/tmp* patterns catch anything started without that env set.
-tmp/
-pymp-*
-tmp*
 **/correlation_package
+**/CARE
+**/data
+**/videos
+# API key sourced by scripts/vis3d/run_gemini.sh -- never commit
+scripts/vis3d/gemini_key.sh

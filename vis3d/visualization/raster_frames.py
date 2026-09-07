@@ -249,6 +249,14 @@ def main():
                         help="Directory of original frame images (e.g. infer_frames.py's --frames_dir). "
                              "If given, also writes vis3d_overlay/: each frame with its rasterized boxes "
                              "alpha-blended on top.")
+    parser.add_argument("--boxes", type=str, default="boxes_3d.json",
+                        help="name of the boxes file inside --output_dir. Point it "
+                             "at gemini_boxes_3d.json to render a review's "
+                             "corrections without overwriting the lift's own, and "
+                             "use --vis_subdir to keep the two sets of images apart.")
+    parser.add_argument("--vis_subdir", type=str, default="vis3d",
+                        help="subdirectory the rendered frames go in (default vis3d; "
+                             "the overlay dir is this + '_overlay')")
     parser.add_argument("--overlay_alpha", type=float, default=0.6,
                         help="Opacity of the rasterized boxes in vis3d_overlay/ (0=invisible, 1=opaque).")
     parser.add_argument("--debug", action="store_true",
@@ -266,13 +274,13 @@ def main():
         output_dir = ROOT / output_dir
     frames_dir = Path(args.frames_dir).resolve() if args.frames_dir else None
 
-    with open(output_dir / "boxes_3d.json") as f:
+    with open(output_dir / args.boxes) as f:
         boxes_by_frame = json.load(f)
 
-    vis_dir = output_dir / "vis3d"
+    vis_dir = output_dir / args.vis_subdir
     vis_dir.mkdir(parents=True, exist_ok=True)
     if frames_dir is not None:
-        overlay_dir = output_dir / "vis3d_overlay"
+        overlay_dir = output_dir / f"{args.vis_subdir}_overlay"
         overlay_dir.mkdir(parents=True, exist_ok=True)
 
     # Every frame of the clip gets an output, not just the ones that lifted to
@@ -302,7 +310,7 @@ def main():
         if "camera" not in entry:
             if boxes or traffic_lights or lanes:
                 raise KeyError(
-                    f"{output_dir / 'boxes_3d.json'} has no per-frame 'camera' entry for "
+                    f"{output_dir / args.boxes} has no per-frame 'camera' entry for "
                     f"{frame}. Re-run lift_frames_to_3d.py: without it there is no way to "
                     "render these boxes through the camera they were fit in (see this "
                     "module's docstring).")

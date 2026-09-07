@@ -471,20 +471,38 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
     - K:      3×3 相机内参
     - depth_max: 用于裁剪深度时的最大深度（如果 Z 超过该值，就当作 depth_max 处理）
 
-    Objects are ordered as wholes, by the depth of their nearest corner, and
-    only then are one object's own faces ordered among themselves. Sorting
-    every face of every object into one list -- which is what this used to do
-    -- lets two objects interleave, and that is not a thing solid vehicles can
-    do: a distant car whose box fell inside the long axis of a nearer van's
-    box was drawn over the van's far face, so the small far box sat on top of
-    the big near one. Face-level sorting is only needed for geometry that can
-    interpenetrate; within one convex box, back-to-front by mean depth is
-    exact.
+    Objects are ordered as wholes, and only then are one object's own faces
+    ordered among themselves. Sorting every face of every object into one list
+    -- which is what this used to do -- lets two objects interleave, and that is
+    not a thing solid vehicles can do: a distant car whose box fell inside the
+    long axis of a nearer van's box was drawn over the van's far face, so the
+    small far box sat on top of the big near one. Face-level sorting is only
+    needed for geometry that can interpenetrate; within one convex box,
+    back-to-front by mean depth is exact.
 
-    The nearest corner rather than the centre decides the order because these
-    boxes vary hugely in length: a 9 m van and a 2 m car can share a centre
-    depth to within 10 cm while the van's nose is 4 m nearer, and it is the
-    nose that the viewer sees in front.
+    Between objects the order comes from where each box meets the road -- the
+    lowest row its silhouette reaches -- and not from its depth. On a common
+    ground plane the two say the same thing, and the contact row says it far
+    more reliably: it is a projected measurement of a box already anchored to
+    its mask, while the depth is the monocular range, which lift_frames_to_3d's
+    GROUND_CONTACT_RANGE measures as three times noisier and which is simply
+    absent whenever the ground-contact fit was rejected and the point map had to
+    stand in.
+
+    That rejection is what makes this more than a tidy-up, because it fires
+    precisely on the objects this has to order: a partly occluded one. On the
+    ambulance clip's frame 69 the car behind the ambulance shows only a 71x66
+    px sliver, whose implied height is 0.42x the car prior and so fails
+    GROUND_SIZE_BAND; its range falls back to the point map at 11 m against the
+    ambulance's 14 m, and the car in front. Its box still meets the road 59 rows
+    higher up the image than the ambulance's does, which is the truth the
+    occlusion destroyed and the anchoring kept.
+
+    Ordering by the nearest corner, which this did before, does not help there
+    -- it was chosen over centre depth because a 9 m van and a 2 m car can share
+    a centre depth while the van's nose is 4 m nearer, and the contact row keeps
+    that property for free: the van's nose reaches further down the image than
+    the car does.
     """
     H, W = canvas.shape[:2]
 
@@ -510,7 +528,7 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
     ]
 
     # ---- 3) 收集所有要绘制的“物体”，每个带自己的面 ----
-    objects_to_draw = []  # 每项：{'near': float, 'faces': [{'poly', 'depth', 'base_color'}]}
+    objects_to_draw = []  # 每项：{'contact_row': float, 'faces': [{'poly', 'depth', 'base_color'}]}
 
     num_vehicles = bboxes.shape[0]
     for vi in range(num_vehicles):
@@ -572,15 +590,23 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
 
         if not faces:
             continue
-        # Straddling the camera plane gives a negative minimum; floored at 0 so
-        # such a box sorts as the nearest thing there is, which it is.
+        # Where this box meets the road, as an image row: the lowest point of
+        # the silhouette, taken over the corners that are in front of the
+        # camera. A box straddling the camera plane has corners that project
+        # nowhere meaningful, so it falls back to the bottom of the canvas --
+        # it is the nearest thing there is, and sorts that way.
+        if in_front.all():
+            contact_row = float(uv[:, 1].max())
+        else:
+            contact_row = float(H)
         objects_to_draw.append({
-            'near': float(max(pts_cam[:, 2].min(), 0.0)),
+            'contact_row': contact_row,
             'faces': faces,
         })
 
     # ---- 4) 物体从远到近排序，物体内部的面同样从远到近 ----
-    objects_to_draw.sort(key=lambda o: o['near'], reverse=True)
+    # Far to near is low row to high row: the road recedes up the image.
+    objects_to_draw.sort(key=lambda o: o['contact_row'])
     faces_to_draw = [face
                      for obj in objects_to_draw
                      for face in sorted(obj['faces'], key=lambda f: f['depth'], reverse=True)]

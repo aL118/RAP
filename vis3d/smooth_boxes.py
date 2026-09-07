@@ -197,6 +197,41 @@ DAMPEN_RANGE = 0.12          # residual sd 11.6% of range
 DAMPEN_SIZE = 0.03           # residual sd 3.5% of angular size
 DAMPEN_CENTRE_PX = 6.0       # residual sd 8.0 px, p90 9.3 px
 
+# --- Range outliers, and why they are an *extent* problem --------------------
+#
+# A deadband removes wander inside a band; it cannot remove an excursion that
+# leaves one and stays out. The ambulance clip has exactly that: over frames
+# 56-60 the ambulance's monocular range reads 42-53 m while the frames either
+# side read 15 and 25, a 3.6x step in one frame and back five frames later.
+#
+# What that ruins is not where the box is drawn -- range_scale rescales the
+# extent by the same factor, so the projection is untouched and the box stays on
+# its object throughout -- but how big the box *is*. A box's metric extent is
+# its angular size times its range, and the angular size here is already smooth
+# (this track's grows 100 -> 700 px without a step over 30%), so every jump in
+# l/w/h is a jump in range wearing a different hat. Across that excursion the
+# ambulance's length reads 2.6 m, then 9.2, then 4.6: one vehicle, three
+# lengths, none of which it is.
+#
+# So the fix is the same median-then-trimmed-mean the angular size already gets,
+# applied to the range before the deadband sees it. On that track it takes the
+# worst per-frame length change from 260% to 28% and leaves the drawn size
+# identical to the pixel (p90 step 7%, max 28%, both before and after) -- which
+# is the point: nothing about the picture changes, only the metres written into
+# the log. The window is --size_window, a duration like every other window here;
+# the band is its own because range noise (12%) is four times the angular size's.
+RANGE_INLIER_FRAC = 0.25
+
+# Last word on the extent, after the range rescale. What survives the range
+# filter is slow drift rather than jumps -- a rigid vehicle whose logged length
+# still creeps because range and angular size disagree about how fast it is
+# approaching -- and a deadband is the operator for that: it holds l/w/h still
+# until the evidence leaves the band, so a box that should be one size stays one
+# size. Applied to the metric extent and therefore the one filter here that does
+# move the projection, which is why the band is loose: at 0.10 it changes the
+# drawn size by less than the range deadband already does.
+DAMPEN_EXTENT = 0.10
+
 # --- Traffic lights ---------------------------------------------------------
 #
 # Lights get the same treatment as boxes and for the same reasons, but they were
@@ -1070,11 +1105,21 @@ def _drop_shadowed_fills(out, frames, fills):
 
 
 def _is_contained(bounds, others) -> bool:
-    """True if `bounds` overlaps one of `others` by more than FILL_CONTAINMENT.
+    """True if `bounds` sits inside one of `others` by more than FILL_CONTAINMENT.
 
-    Containment rather than IoU, and relative to the smaller of the two boxes:
-    a fill swallowed whole by a much larger box has an IoU that says almost
-    nothing while the fill itself is entirely redundant.
+    Directional: it asks whether the *fill* is redundant, not whether the two
+    overlap. Measuring containment against the smaller of the pair -- which is
+    what this did at first -- makes it symmetric, and then a fill is thrown away
+    for covering a box far smaller than itself. That is the wrong way round, and
+    on the ambulance clip it deleted the ambulance twice: at frames 44 and 47 the
+    detector returned only the lower half of it, as a 41 px "car" rather than the
+    120 px truck of every frame either side, and the fill that would have carried
+    the real box across those two frames was discarded for landing on that
+    fragment. The vehicle shrank to a third of itself for one frame, twice.
+
+    So the fill has to be the contained one. A fill swallowed by a box of its own
+    size or larger is a duplicate and goes; a fill that swallows something much
+    smaller is a whole object drawn over a piece of one, and stays.
     """
     low, high = bounds
     area = float(np.prod(np.maximum(high - low, 1e-6)))
@@ -1083,8 +1128,7 @@ def _is_contained(bounds, others) -> bool:
                                      - np.maximum(low, other_low), 0.0))
         if not overlap:
             continue
-        other_area = float(np.prod(np.maximum(other_high - other_low, 1e-6)))
-        if overlap / min(area, other_area) > FILL_CONTAINMENT:
+        if overlap / area > FILL_CONTAINMENT:
             return True
     return False
 
@@ -1405,6 +1449,15 @@ def main():
     ap.add_argument("--dampen_size", type=float, default=DAMPEN_SIZE,
                     help="Deadband on a box's angular size, as a fraction. Removes the "
                          "back-and-forth the rate limit is too coarse to see. 0 disables.")
+    ap.add_argument("--dampen_extent", type=float, default=DAMPEN_EXTENT,
+                    help="Deadband on a box's metric length/width/height, as a fraction. "
+                         "A vehicle is rigid, so this holds l/w/h still until the "
+                         "measurement leaves the band. 0 disables.")
+    ap.add_argument("--range_inlier_frac", type=float, default=RANGE_INLIER_FRAC,
+                    help="Ranges within this fraction of their --size_window median are "
+                         "averaged; the rest are replaced by it. Removes the monocular "
+                         "excursions that a deadband cannot, and which show up as a box "
+                         "changing size rather than moving. 0 disables.")
     ap.add_argument("--dampen_centre_px", type=float, default=DAMPEN_CENTRE_PX,
                     help="Deadband on where a box's centre sits in the image, in pixels. "
                          "The only damping that moves a box off the mask it was anchored "
@@ -1491,7 +1544,15 @@ def main():
                 u = np.array([r[0][0] for r in rays])
                 v = np.array([r[1][0] for r in rays])
                 ranges = np.array([r[2][0] for r in rays])
-                damped = dampen_ratio(ranges, args.dampen_range)
+                # Median-then-trimmed-mean first, deadband second: the deadband
+                # bounds its output to within a band of its input, so an
+                # excursion that leaves the band and stays out survives it
+                # intact. See RANGE_INLIER_FRAC.
+                filtered_range = (
+                    robust_scale_filter(ranges, args.size_window,
+                                        args.range_inlier_frac)
+                    if args.range_inlier_frac > 0 else ranges)
+                damped = dampen_ratio(filtered_range, args.dampen_range)
                 centres = np.stack([
                     from_sight_line(e, uu, vv, rr)[0] for e, uu, vv, rr in
                     zip(entries, dampen(u, args.dampen_centre_px),
@@ -1558,6 +1619,13 @@ def main():
                 # -- with --no_size these are the lifted extents, and they were
                 # paired with the lifted range just the same.
                 dims = dims * range_scale
+            if not args.no_size and args.dampen_extent > 0:
+                # A vehicle is rigid, so its l/w/h is one number per track and
+                # not one per frame. This is the last thing to touch the extent,
+                # after the range rescale, so nothing downstream can put the
+                # drift back. See DAMPEN_EXTENT.
+                dims = np.stack([dampen_ratio(c, args.dampen_extent)
+                                 for c in dims.T], axis=1)
             samples = []
             for k, (fi, slot) in enumerate(zip(t["idx"], t["slot"])):
                 row = out[frames[fi]]["boxes"][slot]
