@@ -6,9 +6,9 @@ import subprocess
 
 import cv2
 
-frame_dir = "/fs/nexus-projects/sim2real/aliu/RAP/data/test/street_race/1/vis3d_overlay"
+frame_dir = "/fs/nexus-projects/sim2real/aliu/RAP/data/CARE_YTB/close_nightcrash/1/gemini_vis3d_overlay"
 output_dir = "/fs/nexus-projects/sim2real/aliu/RAP/scripts/vis3d/videos"
-output_name = frame_dir.split("/")[-3]
+output_name = frame_dir.split("/")[-3]+'_gemini'
 fps = 15.0
 pattern = None  # e.g. "*.jpg"; None = auto-detect *.jpg/*.jpeg/*.png
 

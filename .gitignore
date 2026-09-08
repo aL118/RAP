@@ -23,5 +23,5 @@ MySubmission
 **/CARE
 **/data
 **/videos
-# API key sourced by scripts/vis3d/run_gemini.sh -- never commit
 scripts/vis3d/gemini_key.sh
+**/cookies.txt
