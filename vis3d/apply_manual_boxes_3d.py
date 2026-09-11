@@ -145,6 +145,20 @@ def main():
     manual = json.loads(manual_path.read_text())
     edits = manual.get("edits", {})
 
+    # Edits from `gemini_review_boxes.py --in_boxes <other file>` are anchored to
+    # that file, not to the lift. This script applies onto the lift, where those
+    # anchors point at whatever happens to be nearest -- a different object, or
+    # nothing. That is silent corruption, so it stops instead.
+    anchored_to = manual.get("_anchored_to")
+    if anchored_to and anchored_to != MERGED:
+        raise SystemExit(
+            f"error: {MANUAL} holds edits anchored to {anchored_to}, not {MERGED}.\n"
+            f"       They were written by a review of that file and only mean\n"
+            f"       something when applied to it. Re-run the review without\n"
+            f"       --in_boxes, or apply them with:\n"
+            f"         python gemini_review_boxes.py --from_findings --apply \\\n"
+            f"             --in_boxes {anchored_to} --out_boxes {anchored_to} ...")
+
     # Same rule as apply_manual_boxes.py: always start from the lift's own
     # output. A file that already carries corrections is a previous merge, and
     # re-applying on top of it would delete a second box for every delete.

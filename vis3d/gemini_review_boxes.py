@@ -1201,18 +1201,34 @@ def annotate_findings(image, decided, image_hw):
     return canvas
 
 
-def cached_findings(review_dir: Path, frames):
+def cached_findings(review_dir: Path, frames, in_boxes: str = "boxes_3d.json"):
     """A previous run's raw answers, keyed by frame index. {} if there are none.
 
     findings.json holds what the model said, not what was done with it, so a
     second pass over it can apply different gates, a different --max_add_gap or
     a different --propagate and get a different -- and free -- answer. On a key
     limited to 20 requests a day, re-deriving beats re-asking.
+
+    A finding names a box by the NUMBER drawn on it, which is its index in the
+    file that was reviewed. Replaying answers about one file against a different
+    one therefore retargets every finding at whatever now sits at that index --
+    silently, and catastrophically: replaying a lift's answers onto the file
+    those same answers already corrected deletes a second box for every delete.
+    So the source is recorded when the cache is written, and a mismatch stops
+    the run rather than being repaired by guesswork.
     """
     path = review_dir / "findings.json"
     if not path.exists():
         return {}
     saved = json.loads(path.read_text())
+    reviewed = saved.get("_reviewed", "boxes_3d.json")
+    if reviewed != in_boxes:
+        raise SystemExit(
+            f"error: {path} holds answers about {reviewed}, but this run reviews\n"
+            f"       {in_boxes}. A finding names a box by its index in the file it\n"
+            f"       was shown, so replaying these would edit whatever now sits at\n"
+            f"       that index. Re-run with --in_boxes {reviewed}, or drop\n"
+            f"       --from_findings to ask again about {in_boxes}.")
     index = {frame: fi for fi, frame in enumerate(frames)}
     return {index[frame]: entry for frame, entry in saved.items()
             if frame in index and "findings" in entry}
@@ -1416,7 +1432,7 @@ def decide(findings, boxes, names, camera, drawn, args):
     return decided
 
 
-def anchor_source(out_dir: Path, data: dict):
+def anchor_source(out_dir: Path, data: dict, in_boxes: str = "boxes_3d.json"):
     """The boxes an edit's `at` anchor must be able to find, and whether it differs.
 
     apply_manual_boxes_3d.py always re-applies onto the lift's own output
@@ -1425,7 +1441,15 @@ def anchor_source(out_dir: Path, data: dict):
     moved -- an anchor taken from what was reviewed points at a position the
     lifted file does not have. Returns the lifted data when that is the case, so
     anchors can be remapped back onto it, and None when the two are the same file.
+
+    Under --in_boxes there is nothing to remap: the file being reviewed is also
+    the file the edits are applied to, so an anchor resolved against it already
+    names a box the merge will see. Remapping onto the lift would be actively
+    wrong there -- it would aim each edit at whatever the lift happened to have
+    nearest, which for a box an earlier pass added or moved is a different object.
     """
+    if in_boxes != "boxes_3d.json":
+        return None
     if not data.get("_manual_3d"):
         return None
     pristine = out_dir / "boxes_3d.lifted.json"
@@ -1461,12 +1485,12 @@ def review_clip(clip: str, args, reviewer) -> dict:
     clip_dir = BASE / "data" / args.dataset / clip
     out_dir = clip_dir / args.run if args.run else clip_dir
     frames_dir = Path(args.frames_dir) if args.frames_dir else clip_dir / "frames"
-    boxes_path = out_dir / "boxes_3d.json"
+    boxes_path = out_dir / args.in_boxes
     if not boxes_path.exists():
-        return {"clip": clip, "error": f"no boxes_3d.json in {out_dir}"}
+        return {"clip": clip, "error": f"no {args.in_boxes} in {out_dir}"}
 
     data = json.loads(boxes_path.read_text())
-    lifted = anchor_source(out_dir, data)
+    lifted = anchor_source(out_dir, data, args.in_boxes)
     if args.from_findings and lifted is not None:
         # The cached answers were given about the LIFTED boxes, and a finding
         # names a box by the number drawn on it. Once an apply has run,
@@ -1486,7 +1510,8 @@ def review_clip(clip: str, args, reviewer) -> dict:
     review_dir = out_dir / "gemini_review"
     review_dir.mkdir(exist_ok=True)
 
-    cache = cached_findings(review_dir, frames) if args.from_findings else {}
+    cache = (cached_findings(review_dir, frames, args.in_boxes)
+             if args.from_findings else {})
     if args.from_findings:
         if not cache:
             return {"clip": clip, "error": f"no cached findings in {review_dir}"}
@@ -1676,7 +1701,7 @@ def jsonable(value):
     return value
 
 
-def merge_manual(path: Path, edits: dict) -> dict:
+def merge_manual(path: Path, edits: dict, in_boxes: str = "boxes_3d.json") -> dict:
     """This run's edits into manual_boxes_3d.json, keeping anything hand-made.
 
     Only edits tagged "by": "gemini" are replaced. A file that also holds boxes
@@ -1694,6 +1719,13 @@ def merge_manual(path: Path, edits: dict) -> dict:
     for frame, frame_edits in edits.items():
         kept.setdefault(frame, []).extend(frame_edits)
     merged = dict(existing)
+    # What these anchors were resolved against. apply_manual_boxes_3d.py applies
+    # onto the lift's own boxes, so edits anchored to anything else would land on
+    # whatever the lift happened to have nearest -- it refuses rather than guess.
+    if in_boxes != "boxes_3d.json":
+        merged["_anchored_to"] = in_boxes
+    else:
+        merged.pop("_anchored_to", None)
     merged["edits"] = {k: kept[k] for k in sorted(kept)}
     return merged
 
@@ -1716,6 +1748,9 @@ def write_outputs(out_dir, review_dir, frames, results, edits, stats, args):
             cv2.imwrite(str(review_dir / f"review_{Path(frame).stem}.jpg"), image,
                         [cv2.IMWRITE_JPEG_QUALITY, 85])
 
+    # Which boxes these answers are about; cached_findings refuses to replay them
+    # against anything else. Not a frame key, and skipped by the loader's filter.
+    findings["_reviewed"] = args.in_boxes
     (review_dir / "findings.json").write_text(json.dumps(findings, indent=2) + "\n")
     (review_dir / "report.md").write_text(build_report(frames, results, stats, args))
 
@@ -1728,13 +1763,15 @@ def write_outputs(out_dir, review_dir, frames, results, edits, stats, args):
         print(f"   dry run: {tally}; nothing written")
         return
     manual_path = out_dir / MANUAL
-    manual_path.write_text(json.dumps(merge_manual(manual_path, edits), indent=2) + "\n")
+    manual_path.write_text(
+        json.dumps(merge_manual(manual_path, edits, args.in_boxes), indent=2) + "\n")
     print(f"   wrote {manual_path}: {tally}")
     if args.apply:
-        apply_to_boxes(out_dir, edits, args.out_boxes)
+        apply_to_boxes(out_dir, edits, args.out_boxes, args.in_boxes)
 
 
-def apply_to_boxes(out_dir: Path, edits: dict, out_name: str):
+def apply_to_boxes(out_dir: Path, edits: dict, out_name: str,
+                   in_boxes: str = "boxes_3d.json"):
     """Write a full boxes_3d.json carrying this run's corrections, as `out_name`.
 
     The result is a complete file in the same shape as boxes_3d.json -- every
@@ -1756,21 +1793,27 @@ def apply_to_boxes(out_dir: Path, edits: dict, out_name: str):
     """
     import apply_manual_boxes_3d as apply3d
 
-    source_path = out_dir / apply3d.MERGED
-    pristine_path = out_dir / apply3d.PRISTINE
-    # Always start from the lift's own boxes: the edits were resolved against
-    # them, and their anchors mean nothing in a file that already carries
-    # corrections. Which file that is depends on whether anything has ever been
-    # applied in place here.
-    current = json.loads(source_path.read_text())
-    if current.get("_manual_3d"):
-        if not pristine_path.exists():
-            raise SystemExit(
-                f"error: {source_path} holds in-place corrections but "
-                f"{apply3d.PRISTINE} is gone; re-run stage 3.")
-        boxes_by_frame = json.loads(pristine_path.read_text())
+    if in_boxes != apply3d.MERGED:
+        # Reviewing a corrected file: apply onto that same file, because that is
+        # what every anchor was resolved against. Going back to the lift here
+        # would silently discard the corrections being reviewed.
+        boxes_by_frame = json.loads((out_dir / in_boxes).read_text())
     else:
-        boxes_by_frame = current
+        source_path = out_dir / apply3d.MERGED
+        pristine_path = out_dir / apply3d.PRISTINE
+        # Always start from the lift's own boxes: the edits were resolved against
+        # them, and their anchors mean nothing in a file that already carries
+        # corrections. Which file that is depends on whether anything has ever been
+        # applied in place here.
+        current = json.loads(source_path.read_text())
+        if current.get("_manual_3d"):
+            if not pristine_path.exists():
+                raise SystemExit(
+                    f"error: {source_path} holds in-place corrections but "
+                    f"{apply3d.PRISTINE} is gone; re-run stage 3.")
+            boxes_by_frame = json.loads(pristine_path.read_text())
+        else:
+            boxes_by_frame = current
     boxes_by_frame.pop("_manual_3d", None)
 
     applied, unmatched = apply3d.apply_edits(boxes_by_frame, edits)
@@ -1782,7 +1825,9 @@ def apply_to_boxes(out_dir: Path, edits: dict, out_name: str):
     print(f"   wrote {out_path.name}: {applied['delete']} deleted, "
           f"{applied['replace']} replaced, {applied['add']} added"
           + (f"; {len(unmatched)} anchor(s) matched nothing" if unmatched else ""))
-    print(f"   boxes_3d.json itself is untouched. Render the two side by side:")
+    print(f"   {in_boxes} itself is untouched." if out_path.name != in_boxes
+          else f"   {in_boxes} was reviewed and overwritten in place.")
+    print(f"   Render it with:")
     print(f"     cd visualization && python raster_frames.py --output_dir {out_dir} "
           f"--frames_dir {out_dir.parent}/frames \\\n"
           f"         --boxes {out_name} --vis_subdir gemini_vis3d")
@@ -1922,6 +1967,14 @@ def main():
                     help="also write a complete corrected boxes file (see "
                          "--out_boxes), built by apply_manual_boxes_3d.py's own "
                          "apply_edits. boxes_3d.json is never modified.")
+    ap.add_argument("--in_boxes", default="boxes_3d.json",
+                    help="name of the boxes file to REVIEW, in the run dir. The "
+                         "default is the lift's own output. Point it at a "
+                         "corrected file (gemini_boxes_3d.json) to review the "
+                         "boxes as they now stand rather than as they were "
+                         "lifted -- edits are then anchored to, and applied "
+                         "onto, that file. Pass the same name as --out_boxes to "
+                         "correct it in place.")
     ap.add_argument("--out_boxes", default="gemini_boxes_3d.json",
                     help="name of the corrected boxes file --apply writes, beside "
                          "boxes_3d.json (default gemini_boxes_3d.json)")

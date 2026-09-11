@@ -19,6 +19,7 @@ these clips load through the same SceneLoader/Scene API as the CARLA logs:
     rendered_sensor_blobs/<log_name>/CAM_F0/<token>.jpg
                                                   the rasterization of it
     synthetic_scene_pickles/<scene_token>.pkl     two-stage eval stub, see below
+    info/<clip>.json                              the clip's own info.json
 
 RAP reads BOTH image trees, as a pair. It is never told where the second one
 is: navsim/common/dataclasses.py:77 derives that path from the first by string
@@ -109,6 +110,12 @@ BLOB_DIR_NAME = "sensor_blobs"
 # name into the sensor_blobs one. Renaming either breaks the pairing silently.
 RENDERED_BLOB_DIR_NAME = "rendered_sensor_blobs"
 SYNTHETIC_DIR_NAME = "synthetic_scene_pickles"
+# Each clip's info.json, copied in and renamed to the clip. Nothing navsim reads
+# -- it is the hand-written description of what the clip *is* (weather, road
+# type, event type, event_frames), which otherwise lives only beside the frames
+# and is lost the moment the export tree is handed to anyone. Named by clip and
+# not by scene_token so it can be found without resolving a token first.
+INFO_DIR_NAME = "info"
 
 # Write the synthetic_scene_pickles stub alongside each log. Off costs nothing
 # for training, which never opens that directory; on keeps the tree the same
@@ -1212,6 +1219,42 @@ def export_clip(dataset: str, clip: str, run: str, phase: int) -> None:
     print(f"    {'would ' + rendered_transfer + ' ' if DRY_RUN else ''}{rendered_blob_dir}"
           f"  <- {rendered_dir}{count}")
     write_synthetic_scene(log_name, scene_token, tokens[0])
+    write_clip_info(dataset, clip)
+
+
+def write_clip_info(dataset: str, clip: str) -> None:
+    """Copy data/<dataset>/<clip>/info.json to <DATASET_ROOT>/info/<clip>.json.
+
+    Copied byte for byte rather than re-serialised: it is a hand-edited file and
+    the point is that the exported copy is the same file, not a normalised
+    version of it. Parsed first all the same, so a clip whose info.json has been
+    broken by hand fails here rather than in whatever reads the tree later.
+
+    One caveat for anything that reads `event_frames` out of these: those are
+    indices into the clip's own frames at SOURCE_HZ, which is what they mean
+    where they were written. The log is subsampled to NAVSIM_HZ, so log frame i
+    is source frame `i * (SOURCE_HZ / NAVSIM_HZ) + phase` -- the two index
+    spaces are not the same and nothing here rewrites them.
+
+    Called per phase, which for more than one phase writes the same bytes to the
+    same path repeatedly. Left that way on purpose: the file belongs to the clip,
+    not to the log, and one copy per clip is the thing being asserted.
+    """
+    source = BASE / "data" / dataset / clip / "info.json"
+    destination = DATASET_ROOT / INFO_DIR_NAME / f"{clip}.json"
+    if not source.exists():
+        print(f"    no {source} -- {INFO_DIR_NAME}/{clip}.json not written")
+        return
+    try:
+        json.loads(source.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{source} is not valid JSON: {error}") from None
+    if DRY_RUN:
+        print(f"    would copy {destination}  <- {source}")
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    print(f"    {destination}  <- {source}")
 
 
 def write_synthetic_scene(log_name: str, scene_token: str, initial_token: str) -> None:
@@ -1263,7 +1306,7 @@ def ensure_dataset_tree() -> None:
     no-op and nothing existing is touched or removed.
     """
     for name in (META_DIR_NAME, BLOB_DIR_NAME, RENDERED_BLOB_DIR_NAME,
-                 SYNTHETIC_DIR_NAME):
+                 SYNTHETIC_DIR_NAME, INFO_DIR_NAME):
         (DATASET_ROOT / name).mkdir(parents=True, exist_ok=True)
 
 
@@ -1282,7 +1325,8 @@ def main() -> None:
           f"rendered: {RENDERED_SENSOR_SOURCE}"
           f"{f' +{RENDERED_PAD_ROWS}px' if RENDERED_PAD_ROWS else ''})")
     print(f"  {META_DIR_NAME}/, {BLOB_DIR_NAME}/, {RENDERED_BLOB_DIR_NAME}/"
-          f"{', ' + SYNTHETIC_DIR_NAME + '/' if WRITE_SYNTHETIC_SCENES else ''}")
+          f"{', ' + SYNTHETIC_DIR_NAME + '/' if WRITE_SYNTHETIC_SCENES else ''}"
+          f", {INFO_DIR_NAME}/")
     if not DRY_RUN:
         ensure_dataset_tree()
     for dataset, clip, run in expand_clip_runs(CLIP_RUNS):

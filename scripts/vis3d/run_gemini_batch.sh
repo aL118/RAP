@@ -1,6 +1,7 @@
 #!/bin/bash
 # Submits one sbatch job per clip, each running run_gemini.sh over that clip's
-# own "event_frames" window. Run this on the login node -- it only submits and
+# own "event_frames" window -- or, for a clip whose info.json has no such key,
+# over every frame it has. Run this on the login node -- it only submits and
 # exits in a second. The #SBATCH directives live in run_gemini.sh, which is what
 # each job actually runs; there are deliberately none here.
 #
@@ -10,7 +11,15 @@
 #   CONCURRENT=1 ./run_gemini_batch.sh           # all at once -- see the warning below
 #
 # Every run_gemini.sh knob is forwarded to all jobs (--export=ALL carries the
-# submitting environment): STRIDE, OPS, PROPAGATE, MODEL, RPM, APPLY, FROM_CACHE.
+# submitting environment): STRIDE, OPS, PROPAGATE, MODEL, RPM, APPLY, FROM_CACHE,
+# IN_BOXES.
+#
+# SOURCE in the plan says which boxes each clip is reviewed FROM. A clip that
+# already has gemini_boxes_3d.json is reviewed as it now stands ("gemini") and
+# corrected in place, so a second pass sees the first pass's edits -- and any
+# made by hand since -- rather than re-judging the raw lift and re-reporting
+# faults that have already been fixed. A clip without one falls back to the lift
+# ("lift"). IN_BOXES=boxes_3d.json forces the raw lift everywhere ("forced").
 #
 #   PROPAGATE=track ./run_gemini_batch.sh
 #   FROM_CACHE=1 PROPAGATE=track ./run_gemini_batch.sh   # re-apply, no requests
@@ -58,24 +67,25 @@ CLIPS=(
     # "fallen_load  Add boxes for the yellow roll that fell off the truck and the motorcylist that was hit."
     # "fast_close  Fix box size for the black car that was nearly hit."
 
-    "flying_tire  Add boxes for the tire that flew off the truck and patch missing boxes for the car in front that was hit."
-    "grandma_crash  Fix box sizing for the truck that was hit and remove the box on the dashboard."
-    "help  Fix box size for the black car that was nearly hit and patch missing box when close."
-    "highway_hazard  Add box for the cone on highway and remove the box on the dashboard."
-    "incoming  Fix box size for the car that was nearly hit and patch missing box when close."
-    "merge_in  Lengthen the box for the nearby car to include the trailor and remove the box on the dashboard."
-    "motorcycle_fall  Add boxes for the motorcycle and motorcyclist that fell and remove the box on the dashboard."
-    "night_deer  Fix box size for the deer that was nearly hit and patch missing box when close."
-    "opposing_crash  Fix box sizes for the cars that crashed and remove the box on the dashboard."
-    "petty  Adjust orientation of truck in front and remove box in dashboard."
-    "poland_slip  Fix box size for pedestrian that was nearly hit and patch missing boxes after stop."
-    "pull_out  Fix box sizes for the cars nearby"
-    "reverse_roundabout  Fix box sizes for incoming truck and remove box in dashboard."
-    "roundabout  Fix orientation for all boxes in each frame and remove box in dashboard."
-    "street_race  Adjust box size for car that was hit and patch missing box during collision."
-    "turn_overtake  Increase box sizes for the cars on other side of the road."
-    "uturn  Fix box size for truck that was hit and patch missing box during collision."
-    "yield_runway  Fix box size for the car that was nearly hit and patch missing boxes when passing."
+    # "flying_tire  Add boxes for the tire that flew off the truck and patch missing boxes for the car in front that was hit."
+    # "grandma_crash  Fix box sizing for the truck that was hit and remove the box on the dashboard."
+    # "help  Fix box size for the black car that was nearly hit and patch missing box when close."
+    # "highway_hazard  Add box for the cone on highway and remove the box on the dashboard."
+    # "incoming  Fix box size for the car that was nearly hit and patch missing box when close."
+    # "merge_in  Lengthen the box for the nearby car to include the trailor and remove the box on the dashboard."
+    # "motorcycle_fall  Add boxes for the motorcycle and motorcyclist that fell and remove the box on the dashboard."
+    # "night_deer  Fix box size for the deer that was nearly hit and patch missing box when close."
+    # "opposing_crash  Fix box sizes for the cars that crashed and remove the box on the dashboard."
+    # "petty  Adjust orientation of truck in front and remove box in dashboard."
+    # "poland_slip  Fix box size for pedestrian that was nearly hit and patch missing boxes after stop."
+    # "pull_out  Fix box sizes for the cars nearby"
+    # "reverse_roundabout  Fix box sizes for incoming truck and remove box in dashboard."
+    # "roundabout  Fix orientation for all boxes in each frame and remove box in dashboard."
+    # "street_race  Adjust box size for car that was hit and patch missing box during collision."
+    # "turn_overtake  Increase box sizes for the cars on other side of the road."
+    # "uturn  Fix box size for truck that was hit and patch missing box during collision."
+    # "yield_runway  Fix box size for the car that was nearly hit and patch missing boxes when passing."
+    "grandma_crash  Fix box on truck to better fit and patch missing boxes."
 )
 
 # Extra per-clip instructions, layered on the prompt in run_gemini.sh: one line
@@ -85,34 +95,50 @@ CLIPS=(
 NOTES_FILE="${NOTES_FILE:-}"
 [ -f "$NOTES_FILE" ] || NOTES_FILE=""
 
+# Frames this clip will cost, and how that number was arrived at: "<n> window"
+# for an event_frames range, "<n> all" for a clip with no window, which
+# run_gemini.sh reviews end to end. Must agree with run_gemini.sh's own
+# resolution or the bill printed here is not the bill charged -- both take the
+# frame numbers off the filenames and slice by STRIDE.
 frames_for() {
     python3 -c '
 import json, sys
-info, stride = sys.argv[1], int(sys.argv[2])
+from pathlib import Path
+info, frames_dir, stride = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
 try:
-    w = json.load(open(info)).get("event_frames")
+    window = json.loads(info.read_text()).get("event_frames")
 except FileNotFoundError:
-    print(-1); sys.exit()
-if not w: print(-1); sys.exit()
-print(len(range(w[0], w[1] + 1, stride)))
-' "$BASE/data/$DATASET/$1/info.json" "${STRIDE:-1}" 2>/dev/null || echo -1
+    window = None
+if window:
+    print(len(range(window[0], window[1] + 1, stride)), "window"); sys.exit()
+if not frames_dir.is_dir():
+    print(-1, "-"); sys.exit()
+n = len(sorted(p for p in frames_dir.iterdir()
+               if p.suffix.lower() in {".jpg", ".jpeg", ".png"})[::stride])
+print(n if n else -1, "all")
+' "$BASE/data/$DATASET/$1/info.json" "$BASE/data/$DATASET/$1/frames" "${STRIDE:-1}" \
+      2>/dev/null || echo "-1 -"
 }
 
-printf '%-20s %8s %10s   %s\n' CLIP FRAMES COST REQUEST
+printf '%-20s %5s %-6s %8s %-7s  %s\n' CLIP FRAMES '' COST SOURCE REQUEST
 total=0; runnable=(); requests=()
 for entry in "${CLIPS[@]}"; do
     clip="${entry%% *}"                                  # first word
     note="${entry#"$clip"}"                              # whatever follows it
     note="${note#"${note%%[![:space:]]*}"}"              # trim leading spaces
-    n=$(frames_for "$clip")
+    read -r n scope < <(frames_for "$clip")
+    src=$( [ -f "$BASE/data/$DATASET/$clip/1/${OUT_BOXES:-gemini_boxes_3d.json}" ] \
+           && echo gemini || echo lift )
+    [ -n "${IN_BOXES:-}" ] && src="forced"
     if [ "$n" -lt 0 ]; then
-        printf '%-20s %8s %10s   %s\n' "$clip" "-" "-" "SKIP: no event_frames in info.json"
+        printf '%-20s %8s %10s   %s\n' "$clip" "-" "-" \
+            "SKIP: no event_frames and no frames/ -- is $DATASET/$clip a real clip?"
         continue
     fi
     shown="$note"
     [ ${#shown} -gt 46 ] && shown="${shown:0:43}..."
-    printf '%-20s %8s %10s   %s\n' "$clip" "$n" \
-        "\$$(python3 -c "print(f'{$n*0.0057:.2f}')")" "${shown:--}"
+    printf '%-20s %5s %-6s %8s %-7s  %s\n' "$clip" "$n" "$scope" \
+        "\$$(python3 -c "print(f'{$n*0.0057:.2f}')")" "$src" "${shown:--}"
     total=$((total + n)); runnable+=("$clip"); requests+=("$note")
 done
 echo
@@ -144,7 +170,7 @@ for i in "${!runnable[@]}"; do
     jid=$(sbatch --parsable \
             --job-name="gemini_$clip" \
             "${dep[@]}" \
-            --export=ALL,VIDEO="$clip",DATASET="$DATASET",NOTE="$note",RPM="$per_job_rpm",NOTES_FILE="$NOTES_FILE" \
+            --export=ALL,VIDEO="$clip",DATASET="$DATASET",NOTE="$note",RPM="$per_job_rpm",NOTES_FILE="$NOTES_FILE",IN_BOXES="${IN_BOXES:-}" \
             "$BASE/scripts/vis3d/run_gemini.sh")
     if [ -z "$jid" ]; then
         echo "!! $clip: sbatch failed, skipping" >&2

@@ -1,187 +1,321 @@
-"""Evaluate a trained policy, and probe how much signal the reward actually carries.
+"""Did the round help? Three numbers, on scenes no round ever trained on.
 
-Two modes:
+The training loss says the scorer fits its buffer. That is not the question. The
+question is whether the model now *picks* better trajectories, so this evaluates
+the thing inference actually does: propose, rank, take the argmax, and score what
+came out with the true scorer.
 
-  (default)  Walk the held-out split twice -- once with the policy, once with a zero
-             action -- and report both. The zero-action pass IS the pretrained RAP
-             planner, so the delta between the two columns is the only number that
-             says whether RL helped.
+  selected   true PDMS of the proposal the model's own scorer ranked first.
+             The headline. It moves for two reasons at once -- better proposals
+             and better ranking of them -- which is fine, because that is also the
+             only thing that moves at inference.
+  pool_best  true PDMS of the best proposal in a uniform sample of the proposal
+             set -- what the planner has to offer, independent of how it ranks.
+             `pool_best` rising means the refiners improved. It is NOT a ceiling
+             and `selected` is normally well above it: a good scorer beats a
+             handful of random draws, which is the whole job. At
+             `--proposals-per-scene 64` the sample is the entire proposal set and
+             this becomes the exact oracle, with `selected <= pool_best` again.
+  spearman   rank correlation between predicted and true score over that same
+             uniform sample, averaged over scenes. The direct measure of the
+             scorer, independent of how good the proposals happen to be.
 
-  --probe    No policy needed. Score a handful of hand-made trajectory perturbations
-             per scene to show where the PDM reward has gradient and where it is flat.
-             Run this before a long training job to sanity-check reward shaping.
+Why the sample is uniform
+-------------------------
+Only `selected` may depend on the scorer being evaluated.
+`pool_best` and `spearman` must not, or they cannot be compared across rounds --
+which is the only thing either number is for.
+
+Scoring all 64 proposals on every val scene is the most expensive thing in the
+pipeline, so a subset gets truly scored. If that subset is the top-k under the
+checkpoint's *own* predicted score, then a better scorer surfaces different
+trajectories into it, and both `pool_best` and `spearman` move for that reason
+alone: `pool_best` rises because the sampled set is better, with the proposals
+unchanged, and `spearman` is measured over a differently-restricted range. Round 4
+would then beat round 0 on both without a single proposal having improved.
+
+So the budget is spent as the model's own argmax -- always scored, which is what
+keeps `selected` exact -- plus a uniform draw over the proposal slots, seeded by
+the scene token. The draw is over query-slot indices, which the
+architecture fixes and the scorer does not touch, so every checkpoint is measured
+through the same selection rule. `pool_best` and `spearman` are computed over the
+uniform part alone.
+
+The cost is that `spearman` no longer measures discrimination *near the top*,
+which is the comparison inference actually makes -- most of a uniform draw is
+proposals no scorer would consider. That signal cannot be had comparably without a
+fixed reference model to pick the subset, so it is not reported rather than
+reported misleadingly.
+
+Run it against round 0 first. Every number here is only meaningful as a delta
+against the pretrained planner measured through this same code path, and none of
+them is comparable to a published NAVSIM number: the split is a held-out slice of
+the training sources, and half of it is CARE footage that has no drivable-area
+label at all.
 """
 
 import argparse
+import hashlib
 import sys
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+import torch
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from rl import data as data_module
+from rl.collect import score_jobs
 from rl.config import RLConfig
-from rl.env import RAPPlanningEnv
-from rl.reward import SCORE_KEYS, score_trajectory
+from rl.scoring import PDM_INDEX
+from rl.tracking import RunLog
 
 
-def _summarise(rows: List[Dict[str, float]]) -> Dict[str, float]:
-    out = {key: float(np.mean([r[key] for r in rows])) for key in SCORE_KEYS}
-    out["reward"] = float(np.mean([r["reward"] for r in rows]))
-    out["collision_rate"] = 1.0 - out["no_at_fault_collisions"]
-    return out
+def _spearman(predicted: np.ndarray, true: np.ndarray) -> float:
+    """Rank correlation of two 1-D arrays, ties averaged.
 
-
-def _print_table(policy: Dict[str, float], base: Dict[str, float], n: int) -> None:
-    print(f"\n{n} held-out scenes\n")
-    print(f"{'metric':<28}{'RAP base':>12}{'RL policy':>12}{'delta':>12}")
-    print("-" * 64)
-    for key in list(SCORE_KEYS) + ["collision_rate", "reward"]:
-        delta = policy[key] - base[key]
-        # Lower is better for collision_rate; everything else is higher-is-better.
-        marker = "" if abs(delta) < 1e-6 else (
-            " *" if (delta < 0) == (key == "collision_rate") else "")
-        print(f"{key:<28}{base[key]:>12.4f}{policy[key]:>12.4f}{delta:>+12.4f}{marker}")
-    print("\n* = RL improved on the pretrained RAP planner")
-
-
-def evaluate(model_path: Path, config: RLConfig, n_episodes: int, deterministic: bool) -> int:
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-
-    from rl.env import RLDataset, make_env, split_tokens
-
-    # Count from the token list rather than by constructing an env: RAPPlanningEnv would
-    # load the whole observation cache, and the DummyVecEnv below loads it again anyway.
-    _, val_tokens = split_tokens(RLDataset(config.rl_cache_path).tokens, config.val_fraction)
-    n_episodes = min(n_episodes, len(val_tokens))
-    print(f"[eval] {len(val_tokens)} val scenes available, evaluating {n_episodes}")
-
-    # A 1-env DummyVecEnv, wrapped exactly as training wrapped it. The observation
-    # statistics are part of the trained model: feeding raw observations to a policy
-    # trained on normalised ones produces garbage that looks like a training failure.
-    env = DummyVecEnv([make_env(config, "val", rank=0)])
-    stats_path = Path(model_path).parent / "vecnormalize.pkl"
-    if config.normalize_obs:
-        if not stats_path.exists():
-            raise FileNotFoundError(
-                f"normalize_obs is on but {stats_path} is missing. It is written next to "
-                "final_model.zip by train.py; evaluating without it is meaningless."
-            )
-        env = VecNormalize.load(str(stats_path), env)
-        env.training = False
-        env.norm_reward = False
-
-    model = PPO.load(str(model_path), device="auto")
-
-    policy_rows, base_rows = [], []
-    obs = env.reset()
-    while len(policy_rows) < n_episodes:
-        action, _ = model.predict(obs, deterministic=deterministic)
-        obs, rewards, dones, infos = env.step(action)
-        for info, reward in zip(infos, rewards):
-            policy_rows.append({**{k: info[k] for k in SCORE_KEYS}, "reward": float(reward)})
-            base_rows.append({
-                **{k: info[f"base_{k}"] for k in SCORE_KEYS},
-                # The reward column must be comparable, so report the base's reward on the
-                # same scale the policy is scored on: 0 when the reward is relative.
-                "reward": 0.0 if config.relative_reward else info["base_reward"],
-            })
-        if len(policy_rows) % 50 < env.num_envs:
-            print(f"[eval] {len(policy_rows)}/{n_episodes}")
-
-    policy_rows, base_rows = policy_rows[:n_episodes], base_rows[:n_episodes]
-    _print_table(_summarise(policy_rows), _summarise(base_rows), len(policy_rows))
-    env.close()
-    return 0
-
-
-def probe(config: RLConfig, n_scenes: int) -> int:
-    """Measure reward sensitivity to fixed trajectory perturbations.
-
-    The point of this is calibration. On the 6 scenes checked while building this
-    package, lateral offsets of up to 6 m changed nothing -- the PDM simulator tracks
-    a proposal with an LQR controller that quietly absorbs them -- while doubling the
-    longitudinal extent flipped no_at_fault_collisions to 0 in half of them. If a
-    perturbation column here is identical to 'base', the policy gets no gradient from
-    that direction and residual_scale needs raising.
+    Written out rather than pulled from scipy: this package's environment is the
+    training env, scipy is present but its import costs a second in every worker,
+    and this is twenty lines of argsort.
     """
-    env = RAPPlanningEnv(config, split="val")
-    n_scenes = min(n_scenes, len(env.indices))
+    def rank(values: np.ndarray) -> np.ndarray:
+        order = np.argsort(values)
+        ranks = np.empty(len(values), dtype=np.float64)
+        ranks[order] = np.arange(len(values), dtype=np.float64)
+        # Average the ranks of tied values, which matters here: most proposals in
+        # a safe scene score identically at 1.0 on four of the six sub-scores.
+        unique, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+        for index in np.flatnonzero(counts > 1):
+            tied = inverse == index
+            ranks[tied] = ranks[tied].mean()
+        return ranks
 
-    def variants(base: np.ndarray) -> Dict[str, np.ndarray]:
-        poses = len(base)
-        ramp = np.linspace(0, 1, poses)
-        out = {"base": base}
-        for name, traj in (
-            ("lon x1.5", base * np.array([1.5, 1.0, 1.0])),
-            ("lon x0.5", base * np.array([0.5, 1.0, 1.0])),
-        ):
-            out[name] = traj
-        for metres in (1.0, 4.0):
-            for sign, side in ((1, "left"), (-1, "right")):
-                traj = base.copy()
-                traj[:, 1] += sign * metres * ramp
-                out[f"{side} {metres:g}m"] = traj
-        out["stop"] = np.zeros_like(base)
-        return out
+    if len(predicted) < 2:
+        return float("nan")
+    a, b = rank(predicted), rank(true)
+    a = a - a.mean()
+    b = b - b.mean()
+    denominator = np.sqrt((a * a).sum() * (b * b).sum())
+    return float((a * b).sum() / denominator) if denominator > 0 else float("nan")
 
-    totals: Dict[str, List[float]] = defaultdict(list)
-    collisions: Dict[str, List[float]] = defaultdict(list)
-    for _ in range(n_scenes):
-        env.reset()
-        path = env.metric_cache_paths[env.data.tokens[env._index]]
-        for name, traj in variants(env.base_trajectory()).items():
-            scores = score_trajectory(path, traj)
-            totals[name].append(scores["pdm_score"])
-            collisions[name].append(1.0 - scores["no_at_fault_collisions"])
 
-    print(f"\nReward sensitivity over {n_scenes} scenes\n")
-    print(f"{'perturbation':<16}{'mean PDMS':>12}{'vs base':>12}{'collision rate':>16}")
-    print("-" * 56)
-    base_mean = float(np.mean(totals["base"]))
-    for name in totals:
-        mean = float(np.mean(totals[name]))
-        flat = " <- flat, no gradient" if name != "base" and abs(mean - base_mean) < 1e-4 else ""
-        print(f"{name:<16}{mean:>12.4f}{mean - base_mean:>+12.4f}"
-              f"{float(np.mean(collisions[name])):>16.4f}{flat}")
-    return 0
+def _scored_indices(
+    predicted: np.ndarray, budget: int, token: str
+) -> Tuple[np.ndarray, int]:
+    """Which proposal slots to truly score for one scene.
+
+    Index 0 of the result is the model's own argmax, so `selected` is exact no
+    matter how small the budget is. The rest is a uniform draw over the proposal
+    slots, seeded by the token: the same slots for every checkpoint, so
+    `pool_best` and `spearman` measured over them are comparable across rounds.
+    Slot indices are fixed by the architecture and untouched by the scorer, which
+    is what makes a uniform draw over them scorer-independent -- see the module
+    docstring.
+
+    :return: ``(indices, num_uniform)`` -- ``indices[1:1 + num_uniform]`` is the
+        uniform part, which is what the comparable metrics are computed on.
+    """
+    num_proposals = len(predicted)
+    budget = max(1, min(budget, num_proposals))
+
+    best = int(np.argmax(predicted))
+
+    # Seeded by the token, not by a run-level counter: a scene draws the same
+    # slots whichever order the loader happened to visit it in, and whichever
+    # checkpoint is being evaluated.
+    rng = np.random.default_rng(
+        int.from_bytes(hashlib.md5(token.encode()).digest()[:8], "little")
+    )
+    num_uniform = budget - 1
+    uniform = rng.permutation(num_proposals)[:num_uniform]
+
+    # The draw is over *all* slots, deliberately including `best`. Excluding it
+    # would be the obvious thing and is wrong: the pool would then depend on which
+    # slot the scorer ranked first, so two checkpoints would draw different
+    # uniform parts on the same scene and the whole point of seeding would be
+    # lost. The cost is that `best` lands in the uniform part about
+    # (budget - 1) / num_proposals of the time and is scored twice -- one extra
+    # trajectory in an already-batched call. Row 0 is still the argmax and rows
+    # 1.. are still a uniform sample; nothing double-counts, because `selected`
+    # reads only row 0 and the comparable metrics read only rows 1...
+    return np.concatenate([[best], uniform]).astype(np.int64), num_uniform
+
+
+def evaluate(
+    config: RLConfig,
+    checkpoint: Path,
+    device: torch.device,
+    limit: int = 0,
+    proposals_per_scene: int = 16,
+) -> Dict[str, Dict[str, float]]:
+    """Propose, rank and truly score, on the held-out split of every source.
+
+    :param proposals_per_scene: how many of the model's proposals to truly score
+        per scene -- the argmax plus `proposals_per_scene - 1` drawn uniformly.
+        Scoring all 64 on every val scene is the most expensive thing in the
+        pipeline. Raising this tightens `pool_best` and `spearman` (both are
+        estimates over the uniform part) and does nothing to `selected`, which is
+        exact at any budget. At 64 the uniform part is the whole proposal set and
+        `pool_best` stops being an estimate.
+    """
+    from rl.model import RAPScorer
+
+    sources = data_module.build_sources(config)
+    model = RAPScorer.from_checkpoint(config, checkpoint, device)
+    model.eval()
+
+    results: Dict[str, Dict[str, float]] = {}
+    for name, source in sources.items():
+        tokens = source.tokens
+        if name == "navtrain":
+            tokens = source.scorable_tokens()
+        _, val_tokens = data_module.split_tokens(tokens, config.val_fraction)
+        if limit:
+            val_tokens = val_tokens[:limit]
+        if not val_tokens:
+            continue
+
+        batches = data_module.loader(source, val_tokens, config.batch_size, config.num_workers)
+        jobs, predicted_by_token, uniform_count = [], {}, {}
+
+        with torch.no_grad():
+            for batch_tokens, features in tqdm(batches, desc=f"proposing ({name})"):
+                features = {
+                    key: value.to(device)
+                    for key, value in features.items()
+                    if torch.is_tensor(value)
+                }
+                proposals, predicted = model.propose(features)
+                proposals = proposals.float().cpu().numpy()
+                predicted = predicted.float().cpu().numpy()
+
+                for index, token in enumerate(batch_tokens):
+                    order, num_uniform = _scored_indices(
+                        predicted[index], proposals_per_scene, token
+                    )
+                    jobs.append(
+                        (token, source.name, proposals[index][order].astype(np.float32),
+                         source.scoring_payload(token))
+                    )
+                    predicted_by_token[token] = predicted[index][order]
+                    uniform_count[token] = num_uniform
+
+        scored = score_jobs(jobs, config.score_workers)
+
+        selected, pool_best, correlations = [], [], []
+        for token, _source, _trajectories, _payload in jobs:
+            if token not in scored:
+                continue
+            true = scored[token][0][:, PDM_INDEX]
+            if not np.isfinite(true).any():
+                continue
+
+            # Row 0 is the model's own argmax, rows 1.. the uniform draw. The two
+            # are kept apart on purpose: `selected` is the only number allowed to
+            # depend on the scorer being evaluated.
+            if np.isfinite(true[0]):
+                selected.append(true[0])
+
+            sample = true[1 : 1 + uniform_count[token]]
+            predicted_sample = predicted_by_token[token][1 : 1 + uniform_count[token]]
+            finite = np.isfinite(sample)
+            if finite.any():
+                pool_best.append(np.nanmax(sample))
+                correlations.append(_spearman(predicted_sample[finite], sample[finite]))
+
+        results[name] = {
+            "scenes": float(len(selected)),  # scenes whose argmax scored finitely
+            "selected": float(np.mean(selected)) if selected else float("nan"),
+            "pool_best": float(np.mean(pool_best)) if pool_best else float("nan"),
+            "spearman": float(np.nanmean(correlations)) if correlations else float("nan"),
+        }
+
+    return results
+
+
+def _report(
+    title: str,
+    results: Dict[str, Dict[str, float]],
+    log: Optional[RunLog] = None,
+    round_index: Optional[int] = None,
+    checkpoint: Optional[Path] = None,
+) -> None:
+    """Print the table, and put the same three numbers on the run's timeline.
+
+    Stepped by round, not by the training step counter, and written to its own
+    sink so TensorBoard shows it as a separate run: these are the numbers that
+    decide whether a round helped, and they are worth reading against each other
+    across rounds rather than against a batch axis they have no place on.
+    """
+    print(f"\n{title}")
+    print(f"  {'source':<10}{'scenes':>8}{'selected':>11}{'pool_best':>11}{'spearman':>11}")
+    for name, values in results.items():
+        print(
+            f"  {name:<10}{int(values['scenes']):>8}{values['selected']:>11.4f}"
+            f"{values['pool_best']:>11.4f}{values['spearman']:>11.4f}"
+        )
+        if log is not None and round_index is not None:
+            log.record(values, round_index, f"{name}/", kind="eval",
+                       round=round_index, source=name,
+                       checkpoint=str(checkpoint) if checkpoint else None)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", type=Path, default=None,
-                        help="Path to a PPO .zip. Defaults to <output_path>/final_model.zip")
+    parser.add_argument("--round", type=int, default=None,
+                        help="Evaluate this round's checkpoint. 0 is the pretrained model.")
+    parser.add_argument("--checkpoint", type=Path, default=None,
+                        help="Evaluate an explicit checkpoint instead.")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Also evaluate round 0, so the delta comes from one run.")
     parser.add_argument("--experiment-name", default=None)
-    parser.add_argument("--n-episodes", type=int, default=200)
-    parser.add_argument("--stochastic", action="store_true",
-                        help="Sample actions instead of using the distribution mean.")
-    parser.add_argument("--probe", action="store_true",
-                        help="Reward-sensitivity diagnostic; needs no trained model.")
-    parser.add_argument("--probe-scenes", type=int, default=20)
-    parser.add_argument("--rl-cache-path", type=Path, default=None,
-                        help="Override the precomputed observation cache.")
-    parser.add_argument("--val-fraction", type=float, default=None)
+    parser.add_argument("--limit", type=int, default=0, help="Cap val scenes per source.")
+    parser.add_argument("--proposals-per-scene", type=int, default=16,
+                        help="Proposals truly scored per scene: the model's argmax "
+                             "plus this many minus one drawn uniformly.")
+    parser.add_argument("--regular-ratio", type=float, default=None,
+                        help="0 skips the navtrain source entirely, which is what "
+                             "an experiment collected with --regular-ratio 0 needs "
+                             "-- otherwise this asks for a metric cache the run "
+                             "never used.")
+    parser.add_argument("--score-workers", type=int, default=None)
+    parser.add_argument("--no-tensorboard", action="store_true",
+                        help="Skip the event files under <run>/tb/. The JSONL in "
+                             "<run>/logs/ is written either way.")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     config = RLConfig()
     if args.experiment_name:
         config.experiment_name = args.experiment_name
-    if args.rl_cache_path is not None:
-        config.rl_cache_path = args.rl_cache_path
-    if args.val_fraction is not None:
-        config.val_fraction = args.val_fraction
+    if args.score_workers is not None:
+        config.score_workers = args.score_workers
+    if args.regular_ratio is not None:
+        config.regular_ratio = args.regular_ratio
+    if args.no_tensorboard:
+        config.log_tensorboard = False
     config.validate()
 
-    if args.probe:
-        return probe(config, args.probe_scenes)
+    device = torch.device(args.device)
+    log = RunLog(config.output_path, "eval", config.log_tensorboard)
 
-    model_path = args.model or (config.output_path / "final_model.zip")
-    if not Path(model_path).exists():
-        raise FileNotFoundError(f"No model at {model_path}. Train one, or pass --probe.")
-    return evaluate(Path(model_path), config, args.n_episodes, not args.stochastic)
+    if args.baseline:
+        _report("round 0 (pretrained)", evaluate(
+            config, config.round_checkpoint(0), device, args.limit, args.proposals_per_scene
+        ), log, 0, config.round_checkpoint(0))
+
+    # The round the logged point belongs to. With an explicit --checkpoint this is
+    # a guess, which is why every record also carries the checkpoint path.
+    round_index = args.round if args.round is not None else config.num_rounds
+    checkpoint = args.checkpoint or config.round_checkpoint(round_index)
+    _report(str(checkpoint), evaluate(
+        config, checkpoint, device, args.limit, args.proposals_per_scene
+    ), log, round_index, checkpoint)
+
+    log.close()
+    return 0
 
 
 if __name__ == "__main__":

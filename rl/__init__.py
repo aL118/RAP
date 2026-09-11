@@ -1,26 +1,34 @@
-"""RL fine-tuning of the RAP planner against the NAVSIM PDM score.
+"""Iterative distillation of the true PDM score into RAP's own scorer head.
 
-The original RAP pipeline is supervised: a frozen DINOv3 backbone feeds a
-trajectory head, and the PDM score is used only as a training *signal* for the
-scorer head. This package reuses exactly the same cached data, but treats the
-PDM scorer as an *environment*: the policy proposes a trajectory, the scorer
-returns a reward, collisions are punished.
+RAP already trains its `Scorer` against the true PDM score, but only ever on the
+proposals the model happened to emit at that moment, scored inline, once. This
+package turns that into rounds with a memory:
+
+    round 1   for every scene, take the human trajectory and a subsample of the
+              pretrained model's 64 proposals. Score all of them with the true
+              scorer. Put them in a buffer. Train the scorer on the buffer.
+    round r   sample fresh trajectories from the model round r-1 produced. Score
+              them. APPEND to the buffer -- nothing is replaced. Retrain on
+              everything. Repeat for 3-5 rounds.
+
+Two sources of scenes, mixed deliberately: the CARE clips this is aimed at, and
+enough ordinary navtrain to keep the planner from concluding that the safest thing
+to do in a crash is to stop moving.
 
 Layout::
 
-    rl/config.py       paths and hyper-parameters (one dataclass)
-    rl/reward.py       PDM sub-scores -> scalar reward
-    rl/residual.py     action -> trajectory; shared by the env and the agent
-    rl/precompute.py   one offline pass: RAP cache -> compact RL observations
-    rl/env.py          RAPPlanningEnv, a gymnasium.Env
-    rl/train.py        stable-baselines3 PPO entry point
-    rl/eval.py         held-out evaluation + reward-sensitivity probe
-    rl/agent.py        RLResidualAgent: the policy as a NAVSIM agent, for the benchmark
-    rl/parity_check.py asserts agent.py sees what precompute.py wrote
-
-Note that rl/agent.py is NOT imported here. It pulls in navsim's agent stack and
-stable-baselines3, and it is loaded by hydra inside the devkit's evaluation process;
-importing it eagerly would make `import rl` expensive everywhere else.
+    rl/config.py    paths, round schedule, loss weights (one dataclass)
+    rl/scoring.py   true sub-scores; a nuPlan backend and a map-free CARE one
+    rl/care.py      CARE clip pickles -> scenes the model and the scorer can read
+    rl/data.py      both sources behind one interface, plus batching
+    rl/model.py     RAP wrapped so arbitrary trajectories can be scored
+    rl/buffer.py    the append-only buffer of scored trajectories
+    rl/collect.py   one round: sample, score, append
+    rl/train.py     one round: fit the scorer to the whole buffer
+    rl/loop.py      collect -> train -> repeat, resumable
+    rl/eval.py      selected / pool_best / rank correlation on held-out scenes
+    rl/tracking.py  per-batch scalars to JSONL and TensorBoard
+    rl/export.py    round checkpoint (a delta) -> a self-contained one
 
 See rl/README.md for the design rationale and the run order.
 """

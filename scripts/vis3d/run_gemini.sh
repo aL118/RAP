@@ -46,6 +46,14 @@ NOTES_FILE="${NOTES_FILE:-}"  # a file of notes, one per line, grouped under
                               # [clip] headings -- the batch-friendly form
 OPS="${OPS:-fix,delete,add}"  # drop "add" to keep a pass purely corrective
 BOXES_FROM="${BOXES_FROM:-fit}"
+# Which boxes file to review. Empty = auto: a clip that already has
+# gemini_boxes_3d.json is reviewed as it now stands, so a second pass sees the
+# first pass's corrections (and any hand edits made since) instead of re-judging
+# boxes that have already been fixed -- and re-reporting faults that are gone.
+# A clip with no such file falls back to the lift's own boxes_3d.json.
+# Set IN_BOXES=boxes_3d.json to force a review of the raw lift.
+IN_BOXES="${IN_BOXES:-}"
+OUT_BOXES="${OUT_BOXES:-gemini_boxes_3d.json}"
 # frame = edit only the frames actually reviewed. With STRIDE=1 every frame of
 #         the window is judged first-hand, so a box the reviewer deliberately
 #         left alone stays alone -- and nothing outside the window is touched.
@@ -175,20 +183,36 @@ the ego bonnet", "front face drawn on the rear of a car driving away", or
 PROMPT_END
 
 # --- run -------------------------------------------------------------------
+# A clip with no "event_frames" window is reviewed in full rather than skipped:
+# some faults -- a box on the ego bonnet, wipers or windscreen -- are not events
+# and appear wherever the pipeline drew one, so there is no window to scope them
+# to. Whole-clip is several times the frames of a typical window, so it is
+# several times the money: run_gemini_batch.sh marks these rows "all" and prices
+# them, and LIST=1 shows the bill before anything is submitted.
 if [ -z "$FRAMES" ]; then
     FRAMES=$(python3 -c '
 import json, sys
-info, stride = sys.argv[1], int(sys.argv[2])
+from pathlib import Path
+info, frames_dir, stride = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
 try:
-    meta = json.load(open(info))
+    window = json.loads(info.read_text()).get("event_frames")
 except FileNotFoundError:
-    sys.exit("no info.json at " + info)
-w = meta.get("event_frames")
-if not w:
-    sys.exit("no \"event_frames\" in " + info + " -- add it, or set FRAMES= explicitly")
-lo, hi = w
-print(",".join(str(f) for f in range(lo, hi + 1, stride)))
-' "$BASE/data/$DATASET/$VIDEO/info.json" "$STRIDE") || exit 1
+    window = None                      # no info.json reads as no window
+if window:
+    lo, hi = window
+    frames = list(range(lo, hi + 1, stride))
+else:
+    if not frames_dir.is_dir():
+        sys.exit("no \"event_frames\" in %s and no frames at %s -- add the window, "
+                 "or set FRAMES= explicitly" % (info, frames_dir))
+    # Numbers come off the filenames, not a 0..n-1 range: a clip trimmed with
+    # --keep-numbering, or one with holes, still gets frames that exist.
+    frames = sorted(int(p.name.split(".")[0]) for p in frames_dir.iterdir()
+                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"})[::stride]
+    if not frames:
+        sys.exit("no frames at " + str(frames_dir))
+print(",".join(str(f) for f in frames))
+' "$BASE/data/$DATASET/$VIDEO/info.json" "$BASE/data/$DATASET/$VIDEO/frames" "$STRIDE") || exit 1
 fi
 
 # `conda activate` in a non-interactive shell needs the hook first, which is what
@@ -203,10 +227,29 @@ PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/gemini_review_prompt.XXXXXX")
 trap 'rm -f "$PROMPT_FILE"' EXIT
 printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
 
+# Resolve IN_BOXES here rather than in the Python so the choice is printed with
+# the run and shows up in the job log.
+RUN_DIR="$BASE/data/$DATASET/$VIDEO${RUN:+/$RUN}"
+if [ -z "$IN_BOXES" ]; then
+    if [ -f "$RUN_DIR/$OUT_BOXES" ]; then
+        IN_BOXES="$OUT_BOXES"
+    else
+        IN_BOXES=boxes_3d.json
+    fi
+fi
+echo "reviewing $IN_BOXES -> $OUT_BOXES in $RUN_DIR"
+# `if`, not `[ ... ] && echo`: under set -e a false test there is the whole
+# statement's exit status, so the common case -- a clip with no reviewed file,
+# where the two names differ -- would end the run right here.
+if [ "$IN_BOXES" = "$OUT_BOXES" ]; then
+    echo "  (in place: $OUT_BOXES is both the source and the target)"
+fi
+
 FLAGS=(--dataset "$DATASET" --clip "$VIDEO" --run "$RUN"
        --frames "$FRAMES" --ops "$OPS" --max_add_gap "$MAX_ADD_GAP"
        --propagate "$PROPAGATE"
        --model "$MODEL" --rpm "$RPM" --workers "$WORKERS" --boxes_from "$BOXES_FROM"
+       --in_boxes "$IN_BOXES" --out_boxes "$OUT_BOXES"
        --system_file "$PROMPT_FILE")
 for class in $FIND; do FLAGS+=(--find "$class"); done
 if [ -n "$NOTE" ]; then FLAGS+=(--note "$NOTE"); fi
