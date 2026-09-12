@@ -5,6 +5,8 @@
     python frames_to_video.py --clips street_race grandma_crash
     python frames_to_video.py --subdir vis3d        # the rasters, not the overlays
     python frames_to_video.py --frame_dir /path/to/frames --name whatever
+    python frames_to_video.py --clips back_up --subdir ../frames
+    python frames_to_video.py --clips changelane --frame_range 63:120
 
 One video per clip, named <clip><SUFFIX>.mp4 in --out. A clip whose frames are
 older than its video is skipped, so re-running after re-rendering two clips
@@ -18,6 +20,7 @@ and the summary at the end names every clip that did not get a video.
 import argparse
 import glob
 import os
+import re
 import subprocess
 import sys
 
@@ -35,6 +38,50 @@ def find_frames(frame_dir, pattern=None):
     if pattern:
         return sorted(glob.glob(os.path.join(frame_dir, pattern)))
     return sorted(p for ext in EXTS for p in glob.glob(os.path.join(frame_dir, ext)))
+
+
+# The last run of digits in the stem: 000063.jpg -> 63, frame_000063.jpg -> 63.
+_FRAME_NUMBER = re.compile(r"(\d+)(?!.*\d)")
+
+
+def parse_frame_range(text):
+    """"N:M" -> (N, M), inclusive at both ends."""
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise SystemExit("error: --frame_range wants two numbers separated by a colon, "
+                         f"e.g. 63:120 -- got {text!r}")
+    try:
+        low, high = (int(part) for part in parts)
+    except ValueError:
+        raise SystemExit(f"error: --frame_range bounds must be whole numbers, got {text!r}")
+    if low < 0:
+        raise SystemExit(f"error: --frame_range starts below zero: {text!r}")
+    if low > high:
+        raise SystemExit(f"error: --frame_range is back to front: {text!r}")
+    return low, high
+
+
+def select_range(frame_paths, bounds):
+    """The frames inside `bounds`, and which sense of "frame" was used.
+
+    The bounds are FRAME NUMBERS read out of the filename, not positions in the
+    list. Frames here are named for their number (000063.jpg) and info.json's
+    event_frames are numbers too, so `--frame_range 63:120` should select what
+    the metadata calls frames 63 to 120. The two readings agree while a clip is
+    contiguous from 000000 and diverge as soon as frames are missing or
+    renumbered -- which is precisely when the number is the one you meant.
+
+    Falls back to list positions when the names carry no number at all, so a
+    directory of arbitrarily named renders still works.
+    """
+    low, high = bounds
+    numbered = []
+    for path in frame_paths:
+        match = _FRAME_NUMBER.search(os.path.splitext(os.path.basename(path))[0])
+        if match is None:
+            return frame_paths[low:high + 1], "position"
+        numbered.append((int(match.group(1)), path))
+    return [path for number, path in numbered if low <= number <= high], "frame number"
 
 
 def is_stale(frame_dir, output, frame_paths):
@@ -132,14 +179,26 @@ def main():
                     help="re-encode even when the video is newer than every frame")
     ap.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="say what would be encoded; write nothing")
+    ap.add_argument("--frame_range", default=None, metavar="N:M",
+                    help="only encode frames N to M inclusive, by frame number "
+                         "(e.g. 63:120). The output is named for the range, so a "
+                         "clipped encode never overwrites the full-clip video.")
     args = ap.parse_args()
 
+    bounds = parse_frame_range(args.frame_range) if args.frame_range else None
     targets = clip_dirs(args)
     os.makedirs(args.out, exist_ok=True)
 
     made, skipped, failed = [], [], []
     for i, (clip, frame_dir) in enumerate(targets, 1):
-        output = os.path.join(args.out, f"{clip}{args.suffix}.mp4")
+        # A range goes in the name. Otherwise encoding 63:120 would overwrite the
+        # full-clip mp4 with an excerpt, and the next full run would look "up to
+        # date" against it -- the same way a trimmed clip fools a pure mtime
+        # check, which is what is_stale exists to explain.
+        stem = f"{clip}{args.suffix}"
+        if bounds:
+            stem += f"_{bounds[0]:06d}-{bounds[1]:06d}"
+        output = os.path.join(args.out, f"{stem}.mp4")
         head = f"[{i}/{len(targets)}] {clip}"
 
         if not os.path.isdir(frame_dir):
@@ -151,6 +210,16 @@ def main():
             print(f"{head}: no frames in {frame_dir}, skipping")
             failed.append((clip, "no frames"))
             continue
+        if bounds:
+            available = len(frame_paths)
+            frame_paths, sense = select_range(frame_paths, bounds)
+            if not frame_paths:
+                print(f"{head}: no frames with {sense} in {bounds[0]}:{bounds[1]} "
+                      f"(of {available} present), skipping")
+                failed.append((clip, f"nothing in range {bounds[0]}:{bounds[1]}"))
+                continue
+            print(f"{head}: {len(frame_paths)} of {available} frames "
+                  f"in {bounds[0]}:{bounds[1]} by {sense}")
         if not args.force and not is_stale(frame_dir, output, frame_paths):
             print(f"{head}: up to date ({len(frame_paths)} frames), skipping")
             skipped.append(clip)

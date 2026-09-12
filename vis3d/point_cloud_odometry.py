@@ -98,13 +98,21 @@ def _ransac_rigid(source: np.ndarray, target: np.ndarray, rng: np.random.Generat
     return rotation, translation, int(best_inliers.sum())
 
 
-def _track(previous_gray: np.ndarray, gray: np.ndarray, static_mask: np.ndarray):
+def _track(previous_gray: np.ndarray, gray: np.ndarray, static_mask: np.ndarray,
+           quality: float = None, min_distance: int = None):
     """Lucas-Kanade tracks from `previous_gray` to `gray`, restricted to
     `static_mask` and filtered by a forward-backward check. Returns two (N, 2)
-    arrays of pixel coordinates, or None if too few survive."""
+    arrays of pixel coordinates, or None if too few survive.
+
+    `quality` and `min_distance` override the module defaults, which are tuned
+    for the whole scene; a caller tracking one low-texture surface -- asphalt,
+    say -- needs to keep weaker corners packed more tightly.
+    """
     corners = cv2.goodFeaturesToTrack(
-        previous_gray, maxCorners=MAX_CORNERS, qualityLevel=CORNER_QUALITY,
-        minDistance=CORNER_MIN_DISTANCE, mask=static_mask.astype(np.uint8) * 255)
+        previous_gray, maxCorners=MAX_CORNERS,
+        qualityLevel=CORNER_QUALITY if quality is None else quality,
+        minDistance=CORNER_MIN_DISTANCE if min_distance is None else min_distance,
+        mask=static_mask.astype(np.uint8) * 255)
     if corners is None or len(corners) < MIN_CORRESPONDENCES:
         return None
 
