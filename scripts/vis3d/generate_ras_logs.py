@@ -254,6 +254,17 @@ SPEED_FILE = "ego_speed.json"
 HEADING_FILE = "dash_heading.npy"
 MIN_MEASURED_FRACTION = 0.10
 
+# The measured speed is per frame and noisy -- on close_bike consecutive values
+# swing between 0 and 148 km/h against a true 24-32 mph, and some are negative.
+# Integrated raw, that is a trajectory that backs up 45 m it never drove and a
+# speed label that jumps by 100 km/h between exported frames. So before the
+# poses are built the measured values are median-filtered over SMOOTH_WINDOW_S
+# (unmeasured frames inside the window are ignored), and with CLAMP_REVERSE a
+# negative speed becomes 0: a dashcam car does not reverse. SMOOTH_WINDOW_S = 0
+# and CLAMP_REVERSE = False reproduce the raw integration.
+SMOOTH_WINDOW_S = 0.9
+CLAMP_REVERSE = True
+
 # Re-level the ego frame per clip before writing it.
 #
 # lift_frames_to_3d._camera_to_ego builds the ego frame as z = CAMERA_HEIGHT -
@@ -785,8 +796,20 @@ def measured_poses(run_dir: Path, frame_count: int, source_hz: float):
     if len(yaw) != frame_count:
         return None, f"{HEADING_FILE} has {len(yaw)} headings for {frame_count} frames"
 
+    window = max(1, int(round(SMOOTH_WINDOW_S * source_hz)) | 1)
+    half = window // 2
+    smoothed = np.full(frame_count, np.nan)
+    for i in range(frame_count):
+        near = speed[max(0, i - half): i + half + 1]
+        near = near[np.isfinite(near)]
+        if len(near):
+            smoothed[i] = np.median(near)
+    if CLAMP_REVERSE:
+        smoothed = np.where(np.isfinite(smoothed), np.maximum(smoothed, 0.0), np.nan)
+    has_value = np.isfinite(smoothed)
+
     index = np.arange(frame_count)
-    filled = np.interp(index, index[measured], speed[measured])
+    filled = np.interp(index, index[has_value], smoothed[has_value])
     step = filled / 3.6 / source_hz              # metres advanced into frame i from frame i-1
     step[0] = 0.0
 
@@ -800,7 +823,8 @@ def measured_poses(run_dir: Path, frame_count: int, source_hz: float):
     poses[:, 1, 0], poses[:, 1, 1] = sin_yaw, cos_yaw
 
     note = (f"measured: {data.get('source', '?')} odometry speed "
-            f"({100 * measured.mean():.0f}% of frames measured, gaps interpolated) + "
+            f"({100 * measured.mean():.0f}% of frames measured, {window}-frame median"
+            f"{', reverse clamped' if CLAMP_REVERSE else ''}, gaps interpolated) + "
             f"frame-to-frame heading at {source_hz:g} Hz; {step.sum():.0f} m travelled, "
             f"net heading {np.degrees(yaw[-1]):+.0f} deg; "
             f"reliability {data.get('reliability', 'unverified')}")
