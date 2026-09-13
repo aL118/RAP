@@ -39,15 +39,20 @@ unpickle, so it belongs in the env that will read them.
 All four stages run in **one conda env, `vis3d`** (py3.11 / torch 2.2.0 /
 cu121). That is what the pins and comments in `requirements.txt` exist to hold
 together: stage 1 (GroundingDINO) used to need its own py3.8 / torch-1.12 env,
-stage 2 (UniDepth) a `unidepth` env, stage 4 (OpenVO) a py3.9 / torch-2.0.1
-one, and the stage-4 plot borrowed `drivoR`. Each note below is what it took to
-bring one of those onto the shared floor. `run_render_vis3d.sh` activates
-`vis3d` itself, so no stage needs a per-stage activation and nothing here
-switches envs mid-pipeline.
+stage 2 (UniDepth) a `unidepth` env, and the stage-4 plot borrowed `drivoR`.
+Each note below is what it took to bring one of those onto the shared floor.
+`run_render_vis3d.sh` activates `vis3d` itself, so no stage needs a per-stage
+activation and nothing here switches envs mid-pipeline.
 
-Four things `pip install -r requirements.txt` does *not* cover, each with its
+Three things `pip install -r requirements.txt` does *not* cover, each with its
 own step below: the Grounded-Segment-Anything checkout and its patch, UniDepth
-(installed `--no-deps`), OpenVO's two source builds, and the checkpoints.
+(installed `--no-deps`), and the checkpoints. OpenVO, the learned stage-4 ego
+motion model, is **deprecated**; its two source builds are kept at the
+[bottom of this file](#deprecated-openvo) for anyone who still needs it.
+
+Ego-speed estimation (`run_odometry.sh`, section 3c) also uses a second env,
+**`processor`**, for one step: `estimate_intrinsics.py` (WildCamera needs
+`mmcv.cnn`, which `vis3d` does not have). The script switches to it on its own.
 
 The export at the end is the one part that does not run here at all -- it needs
 the training env, `rap`. See step 6.
@@ -127,33 +132,17 @@ never imports. Its real imports are already in `requirements.txt`. Expect
 `pip check` to keep reporting those undeclared pins afterwards; that is the
 known, intended state of this env.
 
-### 4. Stage 4: OpenVO
+### 4. Stage 4: ego motion
 
-OpenVO is vendored under `vis3d/openvo/`. Two of its dependencies are source
-builds -- the only compilation in this setup:
+Nothing to install. Stage 4 runs the `pointcloud` method -- numpy, OpenCV and
+pycocotools, already in `requirements.txt` -- on stage 2's point maps.
+`run_render_dataset.sh` sets `VO_METHOD=pointcloud` itself.
 
-```bash
-# pytorch3d -- CPU-only is enough; only pytorch3d.transforms is used, and that
-# is pure torch. FORCE_CUDA=0 keeps the build to a few minutes.
-FORCE_CUDA=0 pip install --no-build-isolation \
-  "git+https://github.com/facebookresearch/pytorch3d.git@V0.7.8"
+For metric ego *speed*, prefer section 3c (`run_odometry.sh`): on 18 of the 50
+CARE clips stage 2's depth collapses (the ego's own bonnet comes back 25-30 m
+away), and every depth-based ego-motion method inherits that.
 
-# the correlation CUDA extension, rebuilt against this env's torch
-cd $BASE/vis3d/openvo/model/correlation_package
-git apply $BASE/scripts/vis3d/openvo-correlation-cxx17.patch   # c++14 -> c++17
-CUDA_HOME=/opt/common/cuda/cuda-12.1.1 PATH=$CUDA_HOME/bin:$PATH \
-  pip install --no-build-isolation .
-```
-
-The extension used to ship as a `cpython-39` `.so`, which is what kept stage 4
-in its own py3.9 / torch-2.0.1 env. The CUDA source needed no changes at all --
-only the `-std=c++14` flag in `setup.py`, which torch >= 2.1 headers reject
-outright. Use a `CUDA_HOME` matching torch's build (cu121 here); building needs
-nvcc but not a GPU.
-
-Stage 4 is only reached with `RUN_STAGE4_VO=1` and `VO_METHOD="openvo"`; the
-`pointcloud` method needs neither build, so both steps here can be skipped if
-ego motion is never run through the learned model.
+The learned OpenVO method is deprecated; see [Deprecated: OpenVO](#deprecated-openvo).
 
 ### 5. Checkpoints
 
@@ -192,10 +181,9 @@ python -c "import torch, xformers, timm, unidepth; print(torch.__version__)"
 python -c "import sys; sys.path += ['Grounded-Segment-Anything',
                                     'Grounded-Segment-Anything/GroundingDINO']
 from GroundingDINO.groundingdino.models import build_model; print('stage 1 ok')"
-python -c "import pytorch3d.transforms, correlation_cuda; print('stage 4 ok')"
 ```
 
-Expected: `2.2.0+cu121`, then both `ok` lines. Stage 1 also prints
+Expected: `2.2.0+cu121`, then `stage 1 ok`. Stage 1 also prints
 `groundingdino._C not available; using the pure-PyTorch multi-scale deformable
 attention` -- that warning is the patch working, not a problem. None of this
 needs a GPU, so it runs on the login node.
@@ -614,13 +602,160 @@ RUN_STAGE1B_LANES=0
 RUN_STAGE2_DEPTH=0
 RUN_STAGE3_LIFT=0
 RUN_STAGE4_VO=1
-VO_METHOD="openvo"       # pointcloud (CPU, metric) | openvo (GPU, learned)
+VO_METHOD="pointcloud"   # CPU, from stage 2's point maps. openvo is deprecated -- see the bottom
 EXPORT_NAVSIM=1
 SOURCE_HZ=2              # must match process_ytb.py --hz
 ```
 
+Set `VO_METHOD` explicitly when running `run_render_vis3d.sh` directly: its own
+default is still `openvo`. (`run_render_dataset.sh` sets `pointcloud` for you.)
+
 `ego_trajectory.png` is written on every VO run and is the check worth making:
 a trajectory can look healthy on average speed while its path is a random walk.
+It is drawn from `ego_poses.txt` -- these point-cloud poses -- and **not** from
+the dash/road speeds of section 3c, so re-running odometry does not change it.
+
+## 3c. Ego speed: `run_odometry.sh`
+
+Metric ego speed for every clip in a dataset, measured from the road itself
+rather than from a depth network. It exists because depth-based ego motion
+(stage 4, and OpenVO before it) is badly wrong on this footage: on 18 of the 50
+CARE clips the path comes out 20-100x too short, and OpenVO's per-frame speed on
+`changelane` has essentially no correlation with the dashcam's own speed readout
+(r = 0.07).
+
+### How it works
+
+1. **Road plane.** Camera tilt and height above the road, so a road pixel maps to
+   metres ahead. Measured from two parallel lane lines and the lane width when
+   possible (`calibrate_plane.py`); otherwise fitted from the clip's car
+   detections -- a car's height in pixels grows linearly with how low it sits in
+   the frame, and one line fit gives the horizon and the camera height
+   (`vehicle_horizon.py`). `road_plane.json` records which, as `quality`.
+2. **Dash odometry** (`detect_dashes.py`, `dash_odometry.py`), for clips with
+   dashed lane lines: track individual dashes between frames. The scale comes
+   from the known dash spacing for the clip's `country` in `info.json` (US
+   12.2 m, RU 16.3 m, ...), so an imperfect plane largely cancels out.
+3. **Road odometry** (`road_odometry.py`), for everything else: warp each frame
+   to a bird's-eye view of the road and find the forward shift that lines it up
+   with the next. Only edges crossing the road count (lane lines run with the
+   motion and carry no speed); painted markings -- arrows, stop bars, crosswalks,
+   dash ends -- are weighted up, and dark pixels such as moving shadows are
+   left out. A step is kept only when the 1-, 2- and 3-frame matches agree.
+4. **Selection** (`select_odometry.py`): dash if the road plane was calibrated
+   from lane lines, otherwise road. Written to `ego_speed.json`.
+
+### Running it
+
+Submit through sbatch, with settings in the environment and `--export=ALL`:
+
+```bash
+cd $BASE/scripts/vis3d
+
+# every clip in a dataset, every stage
+DATASET=CARE_YTB sbatch -J odometry --export=ALL run_odometry.sh
+
+# re-do road odometry + selection + report after changing road_odometry.py
+DATASET=CARE_YTB STAGES=road,select,report FORCE=1 sbatch -J odometry --export=ALL run_odometry.sh
+
+# refresh only the selection and the report (seconds)
+DATASET=CARE_YTB STAGES=select,report sbatch -J odometry --export=ALL run_odometry.sh
+
+# one clip (the report still covers the whole dataset)
+DATASET=CARE_YTB CLIPS=back_up STAGES=road,select,report sbatch -J odometry_back_up --export=ALL run_odometry.sh
+
+# interactively on the login node, CPU-only stages
+DATASET=CARE_YTB CLIPS=four_way STAGES=road,select bash run_odometry.sh
+```
+
+Two ways a submission goes wrong without an error:
+
+- **The dataset does not reach the job.** Without `DATASET` in the job's
+  environment it silently runs on the default, `data/test`. Check the first line
+  of the log (`my_dump/<job name>.out.<job id>`): it must say
+  `=== dataset : .../data/<your dataset>`.
+- **Comma lists inside `--export` are split.** `--export=ALL,STAGES=road,select`
+  delivers `STAGES=road` and drops `select`. Put `STAGES` in the environment as
+  above; the log's `=== stages :` line shows what arrived.
+
+### Settings
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `DATASET` | `test` | directory under `data/` |
+| `CLIPS` | every clip with `frames/` | space-separated clip names |
+| `STAGES` | `lanes,intrinsics,vo,plane,dash,road,select,report` | comma-separated; see below |
+| `FORCE` | off | `1` regenerates each selected stage's own output even where it exists |
+| `HZ` | `auto` | frame rate; a number forces it for every clip |
+| `RUN` | `1` | run directory inside each clip |
+| `PARALLEL` | half the CPUs | clips processed at once |
+| `NO_HEADING` | off | `1` skips the slow heading pass in the ground-truth comparison plot |
+| `PITCH_<clip>`, `HEIGHT_<clip>` | unset | hand-set road plane for one clip |
+
+### Stages
+
+| stage | writes | notes |
+| --- | --- | --- |
+| `lanes` | `lane_masks/` | `detect_lanes.py` |
+| `intrinsics` | `camera_intrinsics.json` | `estimate_intrinsics.py`; GPU, `processor` env |
+| `depth` | `samples-pseudodepth/` | UniDepth; slow, not in the default list |
+| `vo` | `ego_poses.txt`, `ego_trajectory.png` | point-cloud VO; needs `samples-pseudodepth/` |
+| `plane` | `road_plane.json` | lane lines, else car detections, else vanishing point / nominal |
+| `dash` | `dashes.json`, `dash_detections.jpg`, `dash_speed.json`, `dash_odometry_vs_ground_truth.png` | the plot only for clips with ground truth |
+| `road` | `road_speed.json` | skipped where it exists unless `FORCE=1` |
+| `select` | `ego_speed.json` | always re-run; JSON only |
+| `report` | `data/<dataset>/odometry_report.json` + a table in the log | always the whole dataset |
+
+A stage **generates the inputs it needs** when they are missing, instead of
+skipping: `lane_masks/` and `camera_intrinsics.json` for the plane,
+`camera_intrinsics.json` for road odometry, `road_plane.json` for dash odometry
+and selection, and a road speed when selection has nothing to choose from.
+`FORCE` never regenerates these borrowed inputs, only the stage's own output.
+Two inputs it cannot make, and names in the log when missing:
+`mask_results_preds.json` and `drivable_masks/`, both from
+`run_render_vis3d.sh` stage 1. Without them road odometry cannot fit the car
+plane, mask vehicles, or find the road and the bonnet edge.
+
+### Frame rate
+
+Every speed is metres per frame times frames per second, and both matchers
+search a fixed distance per frame. With `HZ=auto` each clip's rate is taken from
+`"hz"` in its `info.json` if present, otherwise by matching its first extracted
+frames against its own mp4 at candidate rates (so a clip trimmed at the end
+still reads correctly), otherwise 10 Hz with a warning. The log prints the rate
+and how it was decided.
+
+**Both estimators were validated only at 10 Hz.** Any other rate is flagged as
+unchecked. `back_up` is 2 Hz: road odometry matched none of its 121 frames,
+which gives the right total for that stationary clip but no measured speed.
+
+### Reading the results
+
+`ego_speed.json` holds one speed per frame (`null` where nothing was measured),
+plus `source` (dash or road), the reason for the choice, `plane_quality` and
+`reliability: "unverified"` -- nothing yet tells, without ground truth, whether
+a chosen speed is right.
+
+Ground truth comes from **11 clips that burn their speed into the frame**,
+collected in `data/test/osd_ground_truth.json`. On those, road odometry covers
+this share of the true distance (gaps between measured frames filled, scored
+up to the last on-screen reading):
+
+| within ~35% | rough | fails |
+| --- | --- | --- |
+| `turn_blocker` 101%, `turn_overtake` 106%, `yield_runway` 109%, `ambulance` 119%, `close_bike` 127%, `reserved_lane` 133% | `four_way` 150%, `exit_now` 54% | `changelane` 31%, `too_close` 44% (highway speed); `close_slam` 34% (wet road) |
+
+Dash odometry covers the two highway clips (`changelane` 83%, `too_close` 86%).
+Known limits: at highway speed the road moves too far between frames to match
+reliably, and on wet roads reflections barely move and win the match.
+
+The report's own accuracy table is stricter: it counts unmatched frames as
+0 km/h and pads the truth with zeros after its last reading, so road odometry,
+which leaves more frames unmeasured, reads lower there than in the table above.
+
+To see what dash odometry is detecting, open `dash_detections.jpg`; for a clip
+with ground truth, `dash_odometry_vs_ground_truth.png` plots speed, distance and
+path against the dashcam's readout.
 
 ## 4. Frames to video
 
@@ -738,6 +873,11 @@ beepbeep/
 │   ├── vis3d_overlay/               # stage 3: 163 raster-over-frame jpgs
 │   ├── ego_poses.txt                # stage 4
 │   ├── ego_trajectory.png           # stage 4: the sanity plot
+│   ├── camera_intrinsics.json       # run_odometry.sh: intrinsics
+│   ├── road_plane.json              # run_odometry.sh: plane (+ quality)
+│   ├── dash_speed.json              # run_odometry.sh: dash odometry
+│   ├── road_speed.json              # run_odometry.sh: road odometry
+│   ├── ego_speed.json               # run_odometry.sh: the chosen speed
 │   ├── navsim_logs/                 # export: <split>/<clip>.pkl
 │   └── sensor_blobs/                # export: CAM_F0 symlinks into ../frames/
 └── 2/                               # RUN="2", reusing run 1
@@ -756,3 +896,67 @@ contents are the same either way.
 
 `navsim_logs/` and `sensor_blobs/` *inside a run* are stage 4's per-clip export,
 not what training reads -- step 5 builds that.
+
+## Deprecated: OpenVO
+
+OpenVO, the learned visual-odometry model vendored under `vis3d/openvo/`, is no
+longer used by the pipeline. `run_render_dataset.sh` runs stage 4 with
+`VO_METHOD=pointcloud`, and metric ego speed now comes from `run_odometry.sh`
+(section 3c).
+
+Why: it takes stage 2's depth as input, and on 18 of the 50 CARE clips that
+depth collapses -- the ego's own bonnet comes back 25-30 m away. OpenVO then
+regresses almost no motion (`changelane`: about 10 m of path where the dashcam's
+GPS says 265 m), and its per-frame speed has essentially no correlation with the
+burned-in speed readout (r = 0.07). Swapping the depth model for Metric3D failed
+on the same clips.
+
+The code is still there. `run_render_vis3d.sh`'s own default is still
+`VO_METHOD=openvo` when run directly, and `estimate_ego_motion.py --method openvo`
+still works if the builds below are present.
+
+### Setup (only if you still need it)
+
+Two of its dependencies are source builds:
+
+```bash
+conda activate vis3d
+
+# pytorch3d -- CPU-only is enough; only pytorch3d.transforms is used, and that
+# is pure torch. FORCE_CUDA=0 keeps the build to a few minutes.
+FORCE_CUDA=0 pip install --no-build-isolation \
+  "git+https://github.com/facebookresearch/pytorch3d.git@V0.7.8"
+
+# the correlation CUDA extension, rebuilt against this env's torch
+cd $BASE/vis3d/openvo/model/correlation_package
+git apply $BASE/scripts/vis3d/openvo-correlation-cxx17.patch   # c++14 -> c++17
+CUDA_HOME=/opt/common/cuda/cuda-12.1.1 PATH=$CUDA_HOME/bin:$PATH \
+  pip install --no-build-isolation .
+```
+
+The extension used to ship as a `cpython-39` `.so`, which is what kept stage 4
+in its own py3.9 / torch-2.0.1 env. The CUDA source needed no changes at all --
+only the `-std=c++14` flag in `setup.py`, which torch >= 2.1 headers reject
+outright. Use a `CUDA_HOME` matching torch's build (cu121 here); building needs
+nvcc but not a GPU.
+
+Verify:
+
+```bash
+python -c "import pytorch3d.transforms, correlation_cuda; print('openvo ok')"
+```
+
+### Running it
+
+Stage 4 of `run_render_vis3d.sh` with the learned model, on a clip whose point
+maps already exist:
+
+```bash
+RUN_STAGE1_MASKS=0 RUN_STAGE1B_LANES=0 RUN_STAGE2_DEPTH=0 RUN_STAGE3_LIFT=0 \
+RUN_STAGE4_VO=1 VO_METHOD=openvo EXPORT_NAVSIM=0 \
+VIDEO=<clip> DATASET=<dataset> RUN=1 \
+sbatch --export=ALL $BASE/scripts/vis3d/run_render_vis3d.sh
+```
+
+It needs a GPU and writes `ego_poses.txt` and `ego_trajectory.png` into the run,
+overwriting the point-cloud ones.

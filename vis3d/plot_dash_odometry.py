@@ -174,8 +174,15 @@ def main():
           title=f"stationary control ({len(idx)} frames)\n(truth is exactly 0)")
     a.grid(alpha=.3, axis="x"); a.invert_yaxis()
 
+    plane_note = ""
+    plane_file = run / "road_plane.json"
+    if plane_file.exists():
+        quality = json.loads(plane_file.read_text()).get("quality", "?")
+        plane_note = (f"  --  PLANE: {quality}" if quality != "measured"
+                      else "  --  plane: measured")
     fig.suptitle(f"{name}: lane-dash odometry vs burned-in OSD ground truth "
-                 f"(dash cycle {cycle} m, plane correction {correction:.2f}x)", fontsize=12)
+                 f"(dash cycle {cycle} m, plane correction {correction:.2f}x){plane_note}",
+                 fontsize=12)
     fig.tight_layout()
     out = Path(args.out) if args.out else run / "dash_odometry_vs_ground_truth.png"
     fig.savefig(out, dpi=110)

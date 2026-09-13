@@ -197,6 +197,18 @@ DAMPEN_RANGE = 0.12          # residual sd 11.6% of range
 DAMPEN_SIZE = 0.03           # residual sd 3.5% of angular size
 DAMPEN_CENTRE_PX = 6.0       # residual sd 8.0 px, p90 9.3 px
 
+# A heading change bigger than this is followed by a re-fit of the box to the
+# silhouette it had before the change. The lifter places a box so that its
+# outline AT THE LIFTED HEADING covers the mask; rotating it about the same
+# centre moves and narrows that outline. On data/new/back_up a car straight
+# ahead was lifted at +30 deg, filtered back to -3 deg, and landed 175 px off
+# the car it had been sitting on.
+REFIT_YAW_DEG = 3.0
+# The re-fit may widen or narrow a box by at most this factor, and treats an
+# outline edge within REFIT_BORDER_PX of the image border as cut by the frame.
+REFIT_MAX_WIDTH_RATIO = 1.5
+REFIT_BORDER_PX = 2
+
 # --- Range outliers, and why they are an *extent* problem --------------------
 #
 # A deadband removes wander inside a band; it cannot remove an excursion that
@@ -623,16 +635,30 @@ def rate_limit_angle(yaws, frames, max_step: float, weights=None):
     passes through untouched, while a mode flip arrives as one impossible step
     and is the only thing this can see.
 
-    The output is therefore the running sum of the surviving steps, which fixes
-    the shape of the heading over time but not its offset -- each rejected step
-    leaves everything after it displaced by the amount that was dropped. So the
-    rejected steps cut the track into segments that differ from the measurements
-    by a constant apiece, and `weights` picks which segment's constant to keep:
-    the offset is chosen so that the segment with the most weight reads exactly
-    as measured. Weighting by apparent area and detection score rather than by
-    frame count, for the reason majority_name does -- a heading read off forty
-    frames of a distant smudge is not better evidence than one read off eight
-    frames where the vehicle fills a third of the image.
+    The rejected steps cut the track into segments, each a run the limiter
+    accepted as continuous, and the only question left is which segment holds
+    the real heading. That one -- the anchor -- is kept as measured, and every
+    other segment is moved onto it ONLY if it differs from it by more than
+    `max_step`, i.e. only if it is itself a flip. A segment within `max_step` of
+    the anchor is left exactly as measured.
+
+    That last rule replaced a running sum of the surviving steps, which shifted
+    each segment by every step dropped between it and the anchor. It is exact
+    for a clean flip and wrong for noise: when the heading search's +-10-20 deg
+    staircase gets one step dropped and its return step kept, the running sum
+    leaves every frame behind it permanently rotated by the difference. On
+    data/new/back_up a car that is straight ahead for 40 frames came out at
+    -27 deg for all of them.
+
+    The anchor is the segment with the most evidence -- detection score times
+    apparent area, for the reason majority_name gives -- discounted by how far
+    its mean heading sits from parallel to the road (cos^2), which is the prior
+    the lifter's own heading search applies. Evidence alone picks the wrong
+    segment exactly when it matters: the largest views of a vehicle are the
+    close ones, where the ego's bonnet cuts the mask and the silhouette fit is
+    least reliable. back_up's reversing car flipped 0 -> +30 deg the moment it
+    filled a third of the frame, and area alone anchored the whole track --
+    80 correct frames included -- on the flip.
 
     Doubled angle throughout, as everywhere else here: yaw is defined only up to
     +-pi, so a flip of the representative is not a 180 deg step.
@@ -651,18 +677,31 @@ def rate_limit_angle(yaws, frames, max_step: float, weights=None):
     gaps = np.maximum(np.diff(frames), 1)
     kept = np.abs(steps) <= max_step * gaps
 
-    out = np.concatenate([[0.0], np.cumsum(np.where(kept, steps, 0.0))]) + yaws[0]
-    # A new segment begins at each rejected step; within one, out - yaws is
-    # constant, so any of its samples fixes the offset for the whole segment.
+    # A new segment begins at each rejected step.
     segment = np.concatenate([[0], np.cumsum(~kept)])
+    count = int(segment.max()) + 1
     if weights is None:
         weights = np.ones(len(yaws), dtype=np.float64)
-    anchor = int(np.argmax(np.bincount(segment, weights=np.asarray(weights, float))))
-    first = int(np.argmax(segment == anchor))
-    out -= out[first] - yaws[first]
+    weights = np.asarray(weights, dtype=np.float64)
 
-    # Back to the +-pi/2 representative the rest of this module works in: the
-    # running sum is unbounded, and robust_angle_filter's output is not.
+    means = np.zeros(count)
+    score = np.zeros(count)
+    for s in range(count):
+        index = segment == s
+        means[s] = np.angle(np.mean(np.exp(2j * yaws[index]))) / 2.0
+        score[s] = weights[index].sum() * np.cos(means[s]) ** 2
+    anchor = int(np.argmax(score))
+
+    out = yaws.copy()
+    for s in range(count):
+        if s == anchor:
+            continue
+        offset = np.angle(np.exp(2j * (means[anchor] - means[s]))) / 2.0
+        if abs(offset) > max_step:
+            index = segment == s
+            out[index] = yaws[index] + offset
+
+    # Back to the +-pi/2 representative the rest of this module works in.
     return np.angle(np.exp(2j * out)) / 2.0, int((~kept).sum())
 
 
@@ -794,6 +833,128 @@ def from_sight_line(entry, u, v, depth) -> np.ndarray:
     rays = np.linalg.solve(intrinsics, np.stack([u, v, np.ones(len(u))]))
     camera = rays / rays[2] * np.atleast_1d(np.asarray(depth, dtype=np.float64))
     return (transform[:3, :3].T @ (camera - transform[:3, 3:4])).T
+
+
+def _projected_span(row, camera, yaw=None):
+    """(u0, v0, u1, v1) of a box row's projected outline, and its centre's camera
+    depth -- or None if any corner is at or behind the camera."""
+    transform = np.asarray(camera["ego_to_camera"], dtype=np.float64)
+    intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64)
+    x, y, z = (float(v) for v in row[POS])
+    length, width, height = (float(v) for v in row[DIM])
+    heading = float(row[YAW] if yaw is None else yaw)
+    signs = np.array([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)], float)
+    local = signs * np.array([length, width, height]) / 2.0
+    cos_h, sin_h = np.cos(heading), np.sin(heading)
+    rotation = np.array([[cos_h, -sin_h, 0.0], [sin_h, cos_h, 0.0], [0.0, 0.0, 1.0]])
+    corners = (rotation @ local.T).T + np.array([x, y, z])
+    cam = transform[:3, :3] @ corners.T + transform[:3, 3:4]
+    if np.any(cam[2] <= 1e-3):
+        return None
+    uv = (intrinsics @ cam)[:2] / cam[2]
+    centre = transform[:3, :3] @ np.array([x, y, z]) + transform[:3, 3]
+    return (uv[0].min(), uv[1].min(), uv[0].max(), uv[1].max()), float(centre[2])
+
+
+def refit_to_silhouette(row, lifted_row, camera, passes: int = 4) -> bool:
+    """Moves and widens a re-headed box back onto the outline it was lifted with.
+
+    The target is `lifted_row`'s projection -- the box exactly as the lifter
+    wrote it, before this stage moved, resized or rotated it -- because that is
+    the outline the lifter fitted to the mask. An earlier version used the
+    lifted heading with the smoothed centre and extent, to leave the range and
+    extent filters' work intact; on a car closing fast that outline had already
+    been pulled off the mask by those filters, and the re-fit stopped 85 px
+    short. Called only for boxes whose heading this stage changed, so boxes it
+    did not rotate keep their smoothed on-screen size.
+
+    Horizontal only, and solved rather than stepped. The two unknowns are a
+    slide across the sight line and a scale on the width; the two equations are
+    the outline's left and right edges. Neither maps to its edge linearly for a
+    close box -- the edges that define the outline sit on the near face, metres
+    in front of the centre -- so an update that converted the pixel error at the
+    centre's depth and scaled length along with width stopped 85 px short on
+    back_up after four passes. A few Newton steps on a finite-difference
+    Jacobian land on the edges. Length and height are left alone: scaling length
+    moves the near face toward the camera, and a turn about the vertical axis
+    barely changes the vertical extent.
+
+    :returns: whether the row was changed
+    """
+    target = _projected_span(lifted_row, camera)
+    if target is None or _projected_span(row, camera) is None:
+        return False
+    goal = np.array([target[0][0], target[0][2]])
+
+    # An outline edge on the image border is where the frame cut the object, not
+    # where the object ends -- the same distinction as the lifter's
+    # TRUNCATION_MARGIN_PX. Match only the edge the frame did not cut, by sliding
+    # alone; with both cut there is nothing to match.
+    image_w = float(camera.get("image_hw", (0, np.inf))[1])
+    left_cut = goal[0] <= REFIT_BORDER_PX
+    right_cut = goal[1] >= image_w - 1 - REFIT_BORDER_PX
+    if left_cut and right_cut:
+        return False
+    fit_width = not (left_cut or right_cut)
+    matched = [0, 1] if fit_width else ([1] if left_cut else [0])
+
+    transform = np.asarray(camera["ego_to_camera"], dtype=np.float64)
+    base_centre = transform[:3, :3] @ np.asarray(row[POS], dtype=np.float64) + transform[:3, 3]
+    base_width = float(row[DIM][1])
+    length, height = float(row[DIM][0]), float(row[DIM][2])
+    scale_bound = np.log(REFIT_MAX_WIDTH_RATIO)
+
+    def apply(params):
+        """Row with the camera-x slide params[0] (metres) and width scale exp(params[1])."""
+        trial = list(row)
+        centre = base_centre.copy()
+        centre[0] += params[0]
+        trial[POS] = [float(v) for v in transform[:3, :3].T @ (centre - transform[:3, 3])]
+        trial[DIM] = [length, base_width * float(np.exp(params[1])), height]
+        return trial
+
+    def edges(params):
+        span = _projected_span(apply(params), camera)
+        return None if span is None else np.array([span[0][0], span[0][2]])
+
+    free = [0, 1] if fit_width else [0]
+    params = np.zeros(2)
+    current = edges(params)
+    for _ in range(max(passes, 8)):
+        error = (goal - current)[matched]
+        if np.max(np.abs(error)) < 0.5:
+            break
+        jacobian = np.zeros((len(matched), len(free)))
+        for column, axis in enumerate(free):
+            probe = params.copy()
+            probe[axis] += 0.01
+            moved = edges(probe)
+            if moved is None:
+                return False
+            jacobian[:, column] = (moved - current)[matched] / 0.01
+        step_free, *_ = np.linalg.lstsq(jacobian, error, rcond=None)
+        step = np.zeros(2)
+        step[free] = step_free
+        # Damped so one step cannot throw a corner behind the camera.
+        step = np.clip(step, [-2.0, -0.7], [2.0, 0.7])
+        proposal = params + step
+        # Bounded, because width alone cannot always reproduce the lifted
+        # outline: for a car well off to one side the re-headed silhouette is
+        # dominated by its length seen obliquely, and an unbounded solve drives
+        # the width to zero trying (81 boxes on back_up, ten of them to 0.00x).
+        proposal[1] = float(np.clip(proposal[1], -scale_bound, scale_bound))
+        trial = edges(proposal)
+        if trial is None:
+            proposal = params + (proposal - params) * 0.5
+            trial = edges(proposal)
+            if trial is None:
+                break
+        if np.allclose(proposal, params):
+            break
+        params, current = proposal, trial
+    fitted = apply(params)
+    row[POS], row[DIM] = fitted[POS], fitted[DIM]
+    return True
 
 
 def scale_inliers(values, window: int, inlier_frac: float) -> np.ndarray:
@@ -1458,6 +1619,10 @@ def main():
                          "averaged; the rest are replaced by it. Removes the monocular "
                          "excursions that a deadband cannot, and which show up as a box "
                          "changing size rather than moving. 0 disables.")
+    ap.add_argument("--refit_yaw_deg", type=float, default=REFIT_YAW_DEG,
+                    help="After a box's heading is changed by more than this many degrees, "
+                         "slide and widen it back onto the outline it was lifted with. "
+                         "0 re-fits every box; a negative value turns it off. See REFIT_YAW_DEG.")
     ap.add_argument("--dampen_centre_px", type=float, default=DAMPEN_CENTRE_PX,
                     help="Deadband on where a box's centre sits in the image, in pixels. "
                          "The only damping that moves a box off the mask it was anchored "
@@ -1631,11 +1796,17 @@ def main():
                 row = out[frames[fi]]["boxes"][slot]
                 moved.append(abs(np.angle(np.exp(1j * 2 * (filtered[k] - row[YAW]))) / 2))
                 resized.append(np.max(np.abs(dims[k] - row[DIM]) / np.maximum(row[DIM], 1e-6)))
+                lifted_row = [float(v) for v in row]
                 if centres is not None:
                     nudged.append(float(np.linalg.norm(centres[k] - row[POS])))
                     row[POS] = [float(x) for x in centres[k]]
                 row[YAW] = float(filtered[k])
                 row[DIM] = [float(v) for v in dims[k]]
+                step = abs(np.angle(np.exp(2j * (row[YAW] - lifted_row[YAW]))) / 2)
+                camera = out[frames[fi]].get("camera")
+                if (args.refit_yaw_deg >= 0 and camera is not None
+                        and step > np.radians(args.refit_yaw_deg)):
+                    refit_to_silhouette(row, lifted_row, camera)
                 if slot < len(out[frames[fi]]["names"]):
                     relabelled += out[frames[fi]]["names"][slot] != label
                     out[frames[fi]]["names"][slot] = label

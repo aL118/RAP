@@ -7,7 +7,11 @@ Input is what the vis3d pipeline already produced for a clip:
     frames/                      the extracted video frames
     <run>/boxes_3d.json          lifted boxes + lanes + lights + per-frame camera
     <run>/vis3d/                 the rasterized render of each frame
-    <run>/ego_poses.txt          OpenVO / point-cloud odometry (estimate_ego_motion.py)
+    <run>/ego_speed.json         measured ego speed per frame (run_odometry.sh, select stage)
+    <run>/dash_heading.npy       cumulative yaw per frame (run_odometry.sh, heading stage)
+    <run>/ego_poses.txt          depth-based point-cloud odometry (estimate_ego_motion.py);
+                                 used only where the two files above cannot give a
+                                 trajectory -- see USE_MEASURED_SPEED
 
 Output mirrors carla_garage_data_navsim_converted -- the layout
 run_training_full.py's sim_log_path / sim_sensor_path already point at -- so
@@ -228,6 +232,28 @@ LINK_SENSORS = False
 # Set False only to export for rasterization/inspection, never for training.
 REQUIRE_EGO_POSES = True
 
+# Build each clip's trajectory from measured ego speed and heading instead of
+# ego_poses.txt.
+#
+# ego_poses.txt comes from depth-based visual odometry, and the depth is wrong on
+# much of this footage: on 18 of the 50 CARE clips the path is 20-100x too short,
+# and on changelane the heading drifts -52 deg along a straight motorway.
+# run_odometry.sh measures speed from the road itself (ego_speed.json: dash or
+# road odometry, one speed per frame, null where nothing was measured) and yaw
+# from the rotation between consecutive frames (dash_heading.npy). The pose track
+# here is the integral of the two on a level road: yaw only, frame 0 at the
+# origin, gaps in the speed interpolated between the frames that were measured.
+#
+# The clip's frame rate is taken from ego_speed.json as well, so a clip that is
+# not at SOURCE_HZ (back_up is 2 Hz) is subsampled and differenced at its own
+# rate. A clip whose measured trajectory cannot be built -- no ego_speed.json, no
+# dash_heading.npy, or fewer than MIN_MEASURED_FRACTION of frames measured -- falls
+# back to ego_poses.txt, and the export says so per clip.
+USE_MEASURED_SPEED = True
+SPEED_FILE = "ego_speed.json"
+HEADING_FILE = "dash_heading.npy"
+MIN_MEASURED_FRACTION = 0.10
+
 # Re-level the ego frame per clip before writing it.
 #
 # lift_frames_to_3d._camera_to_ego builds the ego frame as z = CAMERA_HEIGHT -
@@ -434,7 +460,7 @@ def get_ego_dynamic_state() -> list:
     poses, index = FRAME["poses"], FRAME["source_index"]
     if poses is None:
         return [0.0, 0.0, 0.0, 0.0]
-    interval = 1.0 / SOURCE_HZ
+    interval = 1.0 / FRAME.get("source_hz", SOURCE_HZ)
 
     def velocity(i: int) -> np.ndarray:
         previous, following = max(i - 1, 0), min(i + 1, len(poses) - 1)
@@ -670,15 +696,15 @@ def load_ego_poses(poses_path: Path) -> np.ndarray:
     return poses
 
 
-def subsample(frame_names: list, phase: int) -> list:
-    """Drops frames from SOURCE_HZ down to NAVSIM_HZ, keeping the phase-th of
-    each `stride` (see NAVSIM_HZ and PHASES)."""
-    stride = int(round(SOURCE_HZ / NAVSIM_HZ))
+def subsample(frame_names: list, phase: int, source_hz: float = SOURCE_HZ) -> list:
+    """Drops frames from the clip's rate down to NAVSIM_HZ, keeping the phase-th
+    of each `stride` (see NAVSIM_HZ and PHASES)."""
+    stride = int(round(source_hz / NAVSIM_HZ))
     if stride < 1:
-        raise ValueError(f"SOURCE_HZ {SOURCE_HZ} is below navsim's {NAVSIM_HZ} Hz; "
+        raise ValueError(f"source rate {source_hz:g} Hz is below navsim's {NAVSIM_HZ:g} Hz; "
                          "frames cannot be invented, re-extract the clip faster.")
     if not 0 <= phase < stride:
-        raise ValueError(f"PHASES entries must be in [0, {stride}) for SOURCE_HZ={SOURCE_HZ}")
+        raise ValueError(f"PHASES entries must be in [0, {stride}) for a {source_hz:g} Hz clip")
     return frame_names[phase::stride]
 
 
@@ -717,6 +743,68 @@ def find_ego_poses(clip_dir: Path, run_dir: Path):
         if candidate.exists():
             return candidate
     return None
+
+
+def clip_rate(run_dir: Path) -> float:
+    """The clip's frame rate: ego_speed.json's own `hz` when present, else SOURCE_HZ."""
+    path = run_dir / SPEED_FILE
+    if USE_MEASURED_SPEED and path.exists():
+        try:
+            hz = json.loads(path.read_text()).get("hz")
+            if hz:
+                return float(hz)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return SOURCE_HZ
+
+
+def measured_poses(run_dir: Path, frame_count: int, source_hz: float):
+    """(N, 4, 4) ego-to-global poses from measured speed and heading, and a note.
+
+    Returns (None, reason) when the trajectory cannot be built from them. The
+    track lies on a level road: rotation is yaw only, translation advances by the
+    measured distance along the mean heading of each step, and frame 0 is the
+    identity, as the depth-based track's is. Frames with no measured speed take
+    the value interpolated between their measured neighbours; before the first
+    and after the last measured frame the nearest measured speed is held.
+    """
+    speed_path, heading_path = run_dir / SPEED_FILE, run_dir / HEADING_FILE
+    if not speed_path.exists():
+        return None, f"no {SPEED_FILE} (run run_odometry.sh)"
+    data = json.loads(speed_path.read_text())
+    speed = np.array([np.nan if v is None else float(v) for v in data.get("speed_kmh", [])])
+    if len(speed) != frame_count:
+        return None, f"{SPEED_FILE} has {len(speed)} speeds for {frame_count} frames"
+    measured = np.isfinite(speed)
+    if measured.mean() < MIN_MEASURED_FRACTION:
+        return None, (f"only {100 * measured.mean():.0f}% of frames have a measured speed "
+                      f"(need {100 * MIN_MEASURED_FRACTION:.0f}%)")
+    if not heading_path.exists():
+        return None, f"no {HEADING_FILE} (run run_odometry.sh with the heading stage)"
+    yaw = np.load(heading_path).astype(np.float64).reshape(-1)
+    if len(yaw) != frame_count:
+        return None, f"{HEADING_FILE} has {len(yaw)} headings for {frame_count} frames"
+
+    index = np.arange(frame_count)
+    filled = np.interp(index, index[measured], speed[measured])
+    step = filled / 3.6 / source_hz              # metres advanced into frame i from frame i-1
+    step[0] = 0.0
+
+    poses = np.tile(np.eye(4), (frame_count, 1, 1))
+    for i in range(1, frame_count):
+        mean_heading = 0.5 * (yaw[i - 1] + yaw[i])
+        poses[i, :3, 3] = poses[i - 1, :3, 3] + step[i] * np.array(
+            [np.cos(mean_heading), np.sin(mean_heading), 0.0])
+    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+    poses[:, 0, 0], poses[:, 0, 1] = cos_yaw, -sin_yaw
+    poses[:, 1, 0], poses[:, 1, 1] = sin_yaw, cos_yaw
+
+    note = (f"measured: {data.get('source', '?')} odometry speed "
+            f"({100 * measured.mean():.0f}% of frames measured, gaps interpolated) + "
+            f"frame-to-frame heading at {source_hz:g} Hz; {step.sum():.0f} m travelled, "
+            f"net heading {np.degrees(yaw[-1]):+.0f} deg; "
+            f"reliability {data.get('reliability', 'unverified')}")
+    return poses, note
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1154,8 @@ def export_clip(dataset: str, clip: str, run: str, phase: int) -> None:
     real_dir = source_dir(REAL_SENSOR_SOURCE)
     rendered_dir = source_dir(RENDERED_SENSOR_SOURCE)
 
-    stride = int(round(SOURCE_HZ / NAVSIM_HZ))
+    source_hz = clip_rate(run_dir)
+    stride = int(round(source_hz / NAVSIM_HZ))
     log_name = clip if stride == 1 or phase == 0 else f"{clip}_phase{phase}"
 
     with open(run_dir / "boxes_3d.json") as file:
@@ -1117,15 +1206,26 @@ def export_clip(dataset: str, clip: str, run: str, phase: int) -> None:
         print(f"  {empty} of {len(frame_names)} frames lifted nothing; "
               "written with empty annotations")
 
+    measured = None
+    if USE_MEASURED_SPEED:
+        measured, pose_note = measured_poses(run_dir, len(frame_names), source_hz)
     poses_path = find_ego_poses(clip_dir, run_dir)
-    if poses_path is None:
-        message = (f"  {clip}: no ego_poses.txt in {run_dir} or {clip_dir} -- the trajectory "
-                   "label would say the car never moves. Run vis3d/estimate_ego_motion.py.")
-        if REQUIRE_EGO_POSES:
-            print(message + " Skipping.")
-            return
-        print(message + " Exporting anyway (REQUIRE_EGO_POSES is off): NOT for training.")
-    poses = load_ego_poses(poses_path) if poses_path else None
+    if measured is not None:
+        poses = measured
+        print(f"  ego poses: {pose_note}")
+    else:
+        if USE_MEASURED_SPEED:
+            print(f"  ego poses: no measured trajectory ({pose_note}); falling back to "
+                  "ego_poses.txt, the depth-based estimate that is unreliable on much of "
+                  "this footage")
+        if poses_path is None:
+            message = (f"  {clip}: no ego_poses.txt in {run_dir} or {clip_dir} -- the trajectory "
+                       "label would say the car never moves. Run run_odometry.sh.")
+            if REQUIRE_EGO_POSES:
+                print(message + " Skipping.")
+                return
+            print(message + " Exporting anyway (REQUIRE_EGO_POSES is off): NOT for training.")
+        poses = load_ego_poses(poses_path) if poses_path else None
 
     if CORRECT_ROAD_PLANE:
         pitch, offset, count = fit_road_plane(boxes_by_frame)
@@ -1137,14 +1237,18 @@ def export_clip(dataset: str, clip: str, run: str, phase: int) -> None:
                   f"{ROAD_PLANE_MAX_PITCH_DEG:.0f} deg; refusing to rotate. The lift for "
                   "this clip is wrong in some way this correction would only hide.")
         else:
-            apply_road_plane(boxes_by_frame, cameras, poses,
+            # A measured track is already on a level road, independent of the
+            # lift, so levelling the lift must not tilt it; only the depth-based
+            # track lives in the lifted frame and moves with it.
+            apply_road_plane(boxes_by_frame, cameras,
+                             poses if measured is None else None,
                              road_plane_transform(pitch, offset))
             report_road_plane(log_name, pitch, offset, count, cameras, boxes_by_frame)
 
     available = len(frame_names)
-    frame_names = subsample(frame_names, phase)
+    frame_names = subsample(frame_names, phase, source_hz)
     print(f"  {log_name}: {len(frame_names)} of {available} frames "
-          f"({SOURCE_HZ:g} Hz -> {NAVSIM_HZ:g} Hz, phase {phase})")
+          f"({source_hz:g} Hz -> {NAVSIM_HZ:g} Hz, phase {phase})")
 
     if poses is not None:
         needed = max(int(Path(name).stem) for name in frame_names) + 1
@@ -1186,6 +1290,7 @@ def export_clip(dataset: str, clip: str, run: str, phase: int) -> None:
             "log_token": log_token,
             "scene_token": scene_token,
             "poses": poses,
+            "source_hz": source_hz,
             "source_index": source_index,
             "pose": poses[source_index] if poses is not None else np.eye(4),
         })

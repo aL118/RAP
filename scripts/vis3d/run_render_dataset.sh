@@ -87,7 +87,7 @@
 # "turn_blocker, https://www.reddit.com/r/dashcams/comments/1vvdyrx/a_bad_driver_never_misses_their_turn_even_if_they/"
 # "four_way, https://www.reddit.com/r/dashcams/comments/1vv68is/entitled_and_unaware/"
 # "deer_family, https://www.reddit.com/r/dashcams/comments/1vv08nv/something_different/"
-CLIPS=()
+CLIPS=("back_up, https://www.reddit.com/r/dashcams/comments/1wegpz4/rare_is_not_always_at_fault/")
 ######################################################################
 
 BASE=/fs/nexus-projects/sim2real/aliu/RAP
@@ -146,7 +146,7 @@ fi
 # "bash $RENDER" both hand the job the *environment*, so an unexported variable
 # never reaches it and the render silently falls back to its own defaults
 # (DATASET=YTB, RUN=2) while the job name, expanded here, still says otherwise.
-export DATASET="${DATASET:-CARE_YTB}"   # dataset dir under data/
+export DATASET="${DATASET:-new}"   # dataset dir under data/
 export RUN="${RUN-10hz}"                # run subdir the pipeline writes into
 
 # --- RERENDER: redraw from what a clip already holds -------------------------
@@ -193,7 +193,10 @@ export RUN_STAGE2_DEPTH="${RUN_STAGE2_DEPTH:-1}"
 export RUN_STAGE3_LIFT="${RUN_STAGE3_LIFT:-1}"
 export RUN_STAGE4_VO="${RUN_STAGE4_VO:-1}"
 export EXPORT_NAVSIM="${EXPORT_NAVSIM:-1}"
-export VO_METHOD="${VO_METHOD:-openvo}"
+# Point-cloud VO only (CPU, from stage 2's point maps). OpenVO is no longer run
+# from here. Set explicitly rather than left unset: run_render_vis3d.sh's own
+# default is still openvo, and an unset VO_METHOD would quietly fall back to it.
+export VO_METHOD=pointcloud
 # New clips are extracted, detected, lifted and smoothed at SOURCE_HZ, then
 # delivered at SOURCE_HZ/SUBSAMPLE_STRIDE. Processing fast and delivering slow is
 # strictly better than extracting slow: association gates on how far a box moves
@@ -261,13 +264,12 @@ DONE_RUN="${DONE_RUN:-${SUBSAMPLE_RUN:-$RUN}}"
 # Which stages want a card. run_render_vis3d.sh carries #SBATCH --gres=gpu:1 for
 # the common case, and a command-line --gres overrides a directive in the script,
 # so this is where a CPU-only batch gives its cards back. Stage 3 is cv2/numpy
-# and stage 4's pointcloud method is too; only detection, lanes, depth and
-# openvo need one. Getting this wrong costs nothing but a queue slot, which is
+# and stage 4's point-cloud VO is too; only detection, lanes and depth need
+# one. Getting this wrong costs nothing but a queue slot, which is
 # the reason to get it right on a 50-clip batch.
 SBATCH_EXTRA=()
 if [ "$RUN_STAGE1_MASKS" = 1 ] || [ "$RUN_STAGE1B_LANES" = 1 ] \
-   || [ "$RUN_STAGE2_DEPTH" = 1 ] \
-   || { [ "$RUN_STAGE4_VO" = 1 ] && [ "$VO_METHOD" = openvo ]; }; then
+   || [ "$RUN_STAGE2_DEPTH" = 1 ]; then
     NEEDS_GPU=1
 else
     NEEDS_GPU=0

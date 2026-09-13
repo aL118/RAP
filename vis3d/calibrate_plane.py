@@ -85,6 +85,14 @@ MIN_BAND_SPAN_M = 8.0
 # A windscreen-mounted dashcam sits roughly at the driver's eyeline. Outside this
 # the "lane gap" is not a lane -- see the note in estimate().
 MIN_CAMERA_HEIGHT_M, MAX_CAMERA_HEIGHT_M = 1.15, 1.75
+
+# Used when nothing can be measured. A windscreen mount sits roughly at the
+# driver's eyeline; level is the least-wrong assumption absent evidence.
+NOMINAL_PITCH_DEG, NOMINAL_HEIGHT_M = 0.0, 1.35
+
+# Quality ladder, worst to best. Written into road_plane.json as `quality` so a
+# guessed plane can never be mistaken for a measured one downstream.
+QUALITY_ORDER = ("nominal", "vanishing-point", "vehicles", "approximate", "measured")
 PROBE_HEIGHT = 1.3          # any value works; height cancels out of the pitch step
 
 
@@ -232,6 +240,12 @@ def main():
     parser.add_argument("--intrinsics", default=None)
     parser.add_argument("--lane_width", type=float, default=LANE_WIDTH_M)
     parser.add_argument("--frames", type=int, default=60)
+    parser.add_argument("--allow_fallback", action="store_true",
+                        help="when lane geometry cannot be measured, still write a plane -- "
+                             "fitted from the clip's car detections (vehicle_horizon.py), else "
+                             "the lane vanishing point if plausible, else a nominal level camera. "
+                             "road_plane.json records which, in `quality`, and everything "
+                             "downstream carries that label. Without this the clip is skipped.")
     parser.add_argument("--write", action="store_true",
                         help="store the result in <run>/road_plane.json")
     args = parser.parse_args()
@@ -251,20 +265,69 @@ def main():
                                     lane_width=args.lane_width, frames=args.frames)
     print(f"lane VP says pitch {np.degrees(vp.pitch):+.2f} deg, yaw {np.degrees(vp.yaw):+.2f} "
           f"[{vp.source}]")
+    import vehicle_horizon as VH
+    vehicles, vehicle_failure = VH.estimate(run, intrinsics, (k["height"], k["width"]))
+    if vehicles is not None:
+        print(f"car detections say pitch {vehicles['pitch_deg']:+.2f} deg, camera "
+              f"{vehicles['height_m']:.2f} m ({vehicles['inliers']} of {vehicles['cars']} cars)")
+    else:
+        print(f"car-detection plane unavailable: {vehicle_failure}")
+
+    quality = "measured"
     if pitch is None:
-        print(f"parallel-lines calibration FAILED: {extra}")
-        raise SystemExit(1)
-    print(f"parallel lines say pitch {pitch:+.2f} deg "
-          f"(drift crosses zero between {extra['crossing_between'][0]:+.1f} and "
-          f"{extra['crossing_between'][1]:+.1f}, {extra['frames_used']} frames)")
-    print(f"lane width {args.lane_width} m implies camera height {height:.2f} m "
-          f"(gap measured {extra['gap_at_probe_height']:.2f} m at a probe height of {PROBE_HEIGHT})")
+        reason = extra
+        print(f"parallel-lines calibration FAILED: {reason}")
+        if not args.allow_fallback:
+            raise SystemExit(1)
+        # Something is better than nothing, PROVIDED it cannot pass for a
+        # measurement. The car fit is ranked first: it put changelane at +0.68
+        # deg against a hand-measured +0.70 and needs no paint at all. The
+        # vanishing point is a real observation too, just a poor one -- it was
+        # 1.7 deg out on changelane, which came out at 152 km/h against a true
+        # 88 -- so it ranks above a flat guess and below the cars.
+        vp_deg = float(np.degrees(vp.pitch))
+        if vehicles is not None:
+            quality, pitch, height = "vehicles", vehicles["pitch_deg"], vehicles["height_m"]
+            print(f"falling back to the car-detection plane: pitch {pitch:+.2f} deg, "
+                  f"height {height:.2f} m (car height {VH.CAR_HEIGHT_M} m assumed)")
+        elif abs(vp_deg) <= abs(PITCH_SWEEP[-1]):
+            quality, pitch, height = "vanishing-point", vp_deg, NOMINAL_HEIGHT_M
+            print(f"falling back to the lane vanishing point: pitch {pitch:+.2f} deg, "
+                  f"height {height} m assumed")
+        else:
+            quality, pitch, height = "nominal", NOMINAL_PITCH_DEG, NOMINAL_HEIGHT_M
+            print(f"vanishing point ({vp_deg:+.2f} deg) is outside the plausible sweep too; "
+                  f"falling back to a nominal plane: pitch {pitch:+.2f} deg, height {height} m")
+        extra = {"quality": quality, "failure": str(reason)}
+    else:
+        quality = extra.get("quality", "measured") if isinstance(extra, dict) else "measured"
+        if str(quality).startswith("approximate"):
+            quality = "approximate"
+    if quality in ("measured", "approximate"):
+        print(f"parallel lines say pitch {pitch:+.2f} deg "
+              f"(drift crosses zero between {extra['crossing_between'][0]:+.1f} and "
+              f"{extra['crossing_between'][1]:+.1f}, {extra['frames_used']} frames)")
+        print(f"lane width {args.lane_width} m implies camera height {height:.2f} m "
+              f"(gap measured {extra['gap_at_probe_height']:.2f} m at a probe height "
+              f"of {PROBE_HEIGHT})")
+    print(f"PLANE QUALITY: {quality}")
     if args.write:
         dest = run / "road_plane.json"
+        source = {"measured": "parallel lane lines + lane width",
+                  "approximate": "flattest physical drift, no sign change",
+                  "vehicles": "car detections: horizon and camera height, car height assumed",
+                  "vanishing-point": "lane vanishing point, height assumed",
+                  "nominal": "no measurement available; level camera assumed"}[quality]
         dest.write_text(json.dumps(dict(
-            pitch_deg=round(pitch, 3), height_m=round(height, 3),
+            pitch_deg=round(float(pitch), 3), height_m=round(float(height), 3),
             yaw_deg=round(float(np.degrees(vp.yaw)), 3), lane_width_m=args.lane_width,
-            source="parallel lane lines + lane width", vp_pitch_deg=round(float(np.degrees(vp.pitch)), 3)),
+            quality=quality, source=source,
+            failure=extra.get("failure") if isinstance(extra, dict) else None,
+            vp_pitch_deg=round(float(np.degrees(vp.pitch)), 3),
+            # kept even when the lanes won, as an independent cross-check: a
+            # measured plane several degrees off the cars' is worth a look
+            vehicle_pitch_deg=None if vehicles is None else round(vehicles["pitch_deg"], 3),
+            vehicle_height_m=None if vehicles is None else round(vehicles["height_m"], 3)),
             indent=1))
         print(f"wrote {dest}")
 

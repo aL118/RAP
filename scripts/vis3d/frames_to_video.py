@@ -5,8 +5,8 @@
     python frames_to_video.py --clips street_race grandma_crash
     python frames_to_video.py --subdir vis3d        # the rasters, not the overlays
     python frames_to_video.py --frame_dir /path/to/frames --name whatever
-    python frames_to_video.py --clips back_up --subdir ../frames
-    python frames_to_video.py --clips changelane --frame_range 63:120
+    python frames_to_video.py --clips back_up --subdir ../frames --dataset new --frame_range 170:320
+    python frames_to_video.py --clips back_up --subdir vis3d_overlay --dataset new
 
 One video per clip, named <clip><SUFFIX>.mp4 in --out. A clip whose frames are
 older than its video is skipped, so re-running after re-rendering two clips

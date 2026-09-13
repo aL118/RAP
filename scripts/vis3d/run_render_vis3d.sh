@@ -108,11 +108,16 @@ MAX_SHRINK=0.90                  # extent filter may not shrink a box below this
 # Both are per-frame allowances, so both scale DOWN as the frames get denser --
 # the inverse of the windows above, which are durations and scale up. The
 # constants are quoted at the 2 Hz baseline the rest of this block is tuned at:
-# 40 deg and a 4.5x size ratio per frame there, which is 8 deg and 1.35x at the
+# 20 deg and a 4.5x size ratio per frame there, which is 4 deg and 1.35x at the
 # 10 Hz the pipeline actually runs at. At 2 Hz the size limit is wide enough to
 # be no limit, which is the honest answer -- half a second is long enough that a
 # real approach and a blown-up mask are not distinguishable by rate alone.
-MAX_YAW_RATE=${MAX_YAW_RATE:-$(( 40 / SUBSAMPLE_STRIDE ))}
+#
+# The heading limit was 40 deg at 2 Hz, and that let a one-frame flip through:
+# on data/new/back_up the car directly ahead jumped 0 -> +30 deg in one frame
+# when the bonnet started cutting its mask, and stayed there for 40 frames. 20
+# still passes a vehicle genuinely turning ~90 deg in 2.5 s, and catches it.
+MAX_YAW_RATE=${MAX_YAW_RATE:-$(( 20 / SUBSAMPLE_STRIDE ))}
 MAX_SIZE_RATE=${MAX_SIZE_RATE:-$(awk -v s="$SUBSAMPLE_STRIDE" \
     'BEGIN { printf "%.3f", 1.35 ^ (5 / s) - 1 }')}
 # MAX_PX is now a *ceiling* on the association gate rather than the gate itself:
